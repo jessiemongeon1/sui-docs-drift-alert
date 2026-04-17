@@ -1,0 +1,864 @@
+"""
+Docs Impact Monitor
+
+Monitors the MystenLabs/sui release-notes-monitor workflow for completed runs,
+extracts release notes from processed PRs, uses Claude to identify documentation
+impact, generates fixes, and opens PRs with the updates.
+"""
+
+import base64
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+import anthropic
+import requests
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+MONITORED_REPO = os.environ.get("MONITORED_REPO", "MystenLabs/sui")
+MONITORED_WORKFLOW = os.environ.get("MONITORED_WORKFLOW", "release-notes-monitor.yml")
+DOCS_LLMS_URL = os.environ.get("DOCS_LLMS_URL", "https://docs.sui.io/llms.txt")
+DOCS_BASE_URL = os.environ.get("DOCS_BASE_URL", "https://docs.sui.io")
+LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "6"))
+THIS_REPO = os.environ.get("THIS_REPO", "")
+
+# PR creation config
+DOCS_REPO = os.environ.get("DOCS_REPO", "MystenLabs/sui")
+DOCS_REPO_PATH_PREFIX = os.environ.get("DOCS_REPO_PATH_PREFIX", "docs/content")
+FORK_OWNER = os.environ.get("FORK_OWNER", "")  # GitHub user/org to fork under
+CREATE_PRS = os.environ.get("CREATE_PRS", "true").lower() == "true"
+
+GH_API = "https://api.github.com"
+GH_HEADERS = {
+    "Authorization": f"Bearer {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ---------------------------------------------------------------------------
+# GitHub helpers
+# ---------------------------------------------------------------------------
+
+
+def get_recent_workflow_runs() -> list[dict]:
+    """Get completed runs of the monitored workflow within the lookback window."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    url = f"{GH_API}/repos/{MONITORED_REPO}/actions/workflows/{MONITORED_WORKFLOW}/runs"
+    params = {
+        "status": "completed",
+        "per_page": 10,
+        "branch": "main",
+    }
+    resp = requests.get(url, headers=GH_HEADERS, params=params)
+    resp.raise_for_status()
+    runs = resp.json().get("workflow_runs", [])
+
+    recent = []
+    for run in runs:
+        run_time = datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
+        if run_time >= cutoff and run["conclusion"] == "success":
+            recent.append(run)
+    return recent
+
+
+def get_workflow_run_jobs(run_id: int) -> list[dict]:
+    """Get jobs for a workflow run to extract PR numbers from job names."""
+    url = f"{GH_API}/repos/{MONITORED_REPO}/actions/runs/{run_id}/jobs"
+    params = {"per_page": 100}
+    resp = requests.get(url, headers=GH_HEADERS, params=params)
+    resp.raise_for_status()
+    return resp.json().get("jobs", [])
+
+
+def extract_pr_numbers_from_run(run_id: int) -> list[int]:
+    """Extract PR numbers from the workflow run's matrix jobs."""
+    jobs = get_workflow_run_jobs(run_id)
+    pr_numbers = []
+    for job in jobs:
+        name = job.get("name", "")
+        # Jobs are named like "Processing PR (12345)"
+        match = re.search(r"Processing PR\s*\((\d+)\)", name)
+        if match:
+            pr_numbers.append(int(match.group(1)))
+    return pr_numbers
+
+
+def get_pr_details(pr_number: int) -> dict:
+    """Fetch PR title, body, and author."""
+    url = f"{GH_API}/repos/{MONITORED_REPO}/pulls/{pr_number}"
+    resp = requests.get(url, headers=GH_HEADERS)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def extract_release_notes(pr_body: str) -> str:
+    """Extract the release notes section from a PR body."""
+    if not pr_body:
+        return ""
+
+    patterns = [
+        r"(?i)##?\s*release\s*notes?\s*\n(.*?)(?=\n##?\s|\Z)",
+        r"(?i)release\s*notes?:\s*\n(.*?)(?=\n##?\s|\Z)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, pr_body, re.DOTALL)
+        if match:
+            notes = match.group(1).strip()
+            if notes and notes.lower() not in ("none", "n/a", "no", ""):
+                return notes
+
+    return pr_body
+
+
+def get_merged_prs_by_commits(head_sha: str) -> list[int]:
+    """Fallback: find recently merged PRs associated with commits near head_sha."""
+    url = f"{GH_API}/repos/{MONITORED_REPO}/commits/{head_sha}/pulls"
+    resp = requests.get(url, headers=GH_HEADERS)
+    if resp.status_code == 200:
+        return [pr["number"] for pr in resp.json() if pr.get("merged_at")]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Docs helpers
+# ---------------------------------------------------------------------------
+
+
+def fetch_docs_index() -> str:
+    """Fetch the llms.txt docs index."""
+    resp = requests.get(DOCS_LLMS_URL, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
+def fetch_doc_page(url: str) -> str:
+    """Fetch a single doc page as markdown."""
+    resp = requests.get(url, timeout=30)
+    if resp.status_code == 200:
+        return resp.text
+    return f"[Failed to fetch: {resp.status_code}]"
+
+
+def doc_url_to_repo_path(doc_url: str) -> str:
+    """Convert a docs.sui.io URL to a file path in the source repo.
+
+    Example:
+        https://docs.sui.io/develop/objects/dynamic-fields.md
+        -> docs/content/develop/objects/dynamic-fields.mdx
+    """
+    # Strip the base URL to get the relative path
+    path = doc_url.replace(DOCS_BASE_URL, "").lstrip("/")
+
+    # The llms.txt URLs end in .md but source files are .mdx
+    repo_path = f"{DOCS_REPO_PATH_PREFIX}/{path}"
+
+    return repo_path
+
+
+def get_repo_file(repo: str, path: str, ref: str = "main") -> dict | None:
+    """Fetch a file from a GitHub repo. Returns dict with 'content', 'sha', 'path'."""
+    url = f"{GH_API}/repos/{repo}/contents/{path}"
+    params = {"ref": ref}
+    resp = requests.get(url, headers=GH_HEADERS, params=params)
+    if resp.status_code == 200:
+        data = resp.json()
+        content = base64.b64decode(data["content"]).decode("utf-8")
+        return {"content": content, "sha": data["sha"], "path": data["path"]}
+    # Try .mdx if .md failed
+    if path.endswith(".md") and resp.status_code == 404:
+        return get_repo_file(repo, path.replace(".md", ".mdx"), ref)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Claude analysis
+# ---------------------------------------------------------------------------
+
+TRIAGE_SYSTEM = """You are a documentation impact analyst for the Sui blockchain project.
+
+Given release notes from merged PRs, determine which changes could affect existing documentation. Focus on:
+
+1. **API changes**: New, modified, or removed API methods/endpoints (JSON-RPC, GraphQL, SDK methods)
+2. **Deprecations**: Features, functions, or patterns marked as deprecated
+3. **Breaking changes**: Anything that changes existing behavior developers rely on
+4. **New features**: Significant new capabilities that should be documented
+5. **Configuration changes**: Changes to CLI flags, environment variables, config files
+6. **Move framework changes**: Changes to standard library modules, object model, transaction types
+
+For each impactful change, output a JSON array of objects with:
+- "pr_number": the PR number
+- "change_summary": brief description of the doc-affecting change
+- "change_type": one of "api_change", "deprecation", "breaking_change", "new_feature", "config_change", "framework_change"
+- "search_terms": array of specific terms to search for in docs (function names, module names, API endpoints, etc.)
+
+If NO changes affect documentation, return an empty array: []
+
+Return ONLY valid JSON, no markdown fencing."""
+
+DOCS_MATCH_SYSTEM = """You are a documentation reviewer for the Sui blockchain project.
+
+Given a specific code change and a list of documentation pages (with URLs and titles from llms.txt), identify which documentation pages are MOST LIKELY to need updates.
+
+Be selective — only flag pages that are clearly relevant. Consider:
+- Pages that directly document the changed API/feature
+- Tutorial pages that use the changed API
+- Reference pages that list the changed items
+- Concept pages that explain the changed behavior
+
+Return a JSON array of objects:
+- "doc_url": the URL of the affected doc page
+- "doc_title": the title/description from the index
+- "reason": why this page likely needs updating
+- "urgency": "high" (incorrect/broken info), "medium" (missing new info), "low" (minor update needed)
+
+Return ONLY valid JSON, no markdown fencing. If no docs are affected, return []."""
+
+DOC_REVIEW_SYSTEM = """You are a documentation reviewer for the Sui blockchain project.
+
+You are given:
+1. A description of a code change from a PR
+2. The current content of a documentation page
+
+Determine if this documentation page needs to be updated because of the change. If so, explain:
+- What specific section(s) need updating
+- What is currently wrong or missing
+- What the update should say (brief suggestion)
+
+Be precise — reference specific headings, code examples, or paragraphs.
+If the page does NOT need updating for this change, say "NO_UPDATE_NEEDED" and briefly explain why.
+"""
+
+DOC_EDIT_SYSTEM = """You are a technical writer for the Sui blockchain project.
+
+You are given:
+1. A description of a code change from a merged PR
+2. A review explaining what needs to change in the documentation
+3. The FULL current content of the source documentation file (mdx/md format)
+
+Your job is to produce the COMPLETE updated file content with the necessary changes applied.
+
+Rules:
+- Make ONLY the changes needed to address the code change. Do not rewrite or reorganize unrelated content.
+- Preserve all existing formatting, frontmatter, imports, and MDX components exactly.
+- For deprecations: add a clear note (e.g., :::caution or an admonition) and update any code examples.
+- For new features: add documentation in the appropriate section, matching the style of surrounding content.
+- For API changes: update signatures, parameters, return types, and examples as needed.
+- Keep the same tone and style as the existing document.
+
+Return ONLY the complete updated file content. No explanations, no markdown fencing around the whole file.
+"""
+
+
+def triage_release_notes(prs_with_notes: list[dict]) -> list[dict]:
+    """Ask Claude which release notes affect documentation."""
+    pr_summaries = []
+    for pr in prs_with_notes:
+        pr_summaries.append(
+            f"PR #{pr['number']}: {pr['title']}\n"
+            f"Author: {pr['author']}\n"
+            f"Release Notes:\n{pr['release_notes']}\n"
+        )
+
+    content = "\n---\n".join(pr_summaries)
+    if not content.strip():
+        return []
+
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        system=TRIAGE_SYSTEM,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    response_text = message.content[0].text.strip()
+    if response_text.startswith("```"):
+        response_text = re.sub(r"^```(?:json)?\n?", "", response_text)
+        response_text = re.sub(r"\n?```$", "", response_text)
+
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        print(f"WARNING: Could not parse triage response:\n{response_text}")
+        return []
+
+
+def find_affected_docs(change: dict, docs_index: str) -> list[dict]:
+    """Ask Claude which doc pages are affected by a specific change."""
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        system=DOCS_MATCH_SYSTEM,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"## Change\n"
+                    f"PR #{change['pr_number']}: {change['change_summary']}\n"
+                    f"Type: {change['change_type']}\n"
+                    f"Search terms: {', '.join(change.get('search_terms', []))}\n\n"
+                    f"## Documentation Index (llms.txt)\n{docs_index}"
+                ),
+            }
+        ],
+    )
+
+    response_text = message.content[0].text.strip()
+    if response_text.startswith("```"):
+        response_text = re.sub(r"^```(?:json)?\n?", "", response_text)
+        response_text = re.sub(r"\n?```$", "", response_text)
+
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        print(f"WARNING: Could not parse docs match response:\n{response_text}")
+        return []
+
+
+def review_doc_page(change: dict, doc_url: str, doc_content: str) -> str:
+    """Ask Claude to review a specific doc page against a change."""
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        system=DOC_REVIEW_SYSTEM,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"## Code Change\n"
+                    f"PR #{change['pr_number']}: {change['change_summary']}\n"
+                    f"Type: {change['change_type']}\n\n"
+                    f"## Documentation Page: {doc_url}\n\n"
+                    f"{doc_content[:15000]}"
+                ),
+            }
+        ],
+    )
+    return message.content[0].text.strip()
+
+
+def generate_doc_edit(change: dict, review: str, file_content: str) -> str:
+    """Ask Claude to produce the updated file content."""
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=16384,
+        system=DOC_EDIT_SYSTEM,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"## Code Change\n"
+                    f"PR #{change['pr_number']}: {change['change_summary']}\n"
+                    f"Type: {change['change_type']}\n\n"
+                    f"## Review Notes\n{review}\n\n"
+                    f"## Current File Content\n{file_content}"
+                ),
+            }
+        ],
+    )
+    return message.content[0].text.strip()
+
+
+# ---------------------------------------------------------------------------
+# GitHub PR creation
+# ---------------------------------------------------------------------------
+
+
+def ensure_fork(upstream_repo: str, fork_owner: str) -> str:
+    """Ensure a fork exists. Returns the fork's full name (owner/repo)."""
+    repo_name = upstream_repo.split("/")[1]
+    fork_full = f"{fork_owner}/{repo_name}"
+
+    # Check if fork already exists
+    resp = requests.get(f"{GH_API}/repos/{fork_full}", headers=GH_HEADERS)
+    if resp.status_code == 200:
+        print(f"    Fork exists: {fork_full}")
+        return fork_full
+
+    # Create fork
+    print(f"    Creating fork of {upstream_repo}...")
+    resp = requests.post(
+        f"{GH_API}/repos/{upstream_repo}/forks",
+        headers=GH_HEADERS,
+        json={"organization": fork_owner} if "/" not in fork_owner else {},
+    )
+    if resp.status_code in (200, 202):
+        fork_full = resp.json()["full_name"]
+        print(f"    Fork created: {fork_full}")
+        # Wait for fork to be ready
+        for _ in range(10):
+            time.sleep(3)
+            check = requests.get(f"{GH_API}/repos/{fork_full}", headers=GH_HEADERS)
+            if check.status_code == 200:
+                break
+        return fork_full
+    else:
+        raise RuntimeError(f"Failed to create fork: {resp.status_code} {resp.text}")
+
+
+def sync_fork(fork_repo: str, upstream_repo: str, branch: str = "main"):
+    """Sync the fork's default branch with upstream."""
+    resp = requests.post(
+        f"{GH_API}/repos/{fork_repo}/merge-upstream",
+        headers=GH_HEADERS,
+        json={"branch": branch},
+    )
+    if resp.status_code == 200:
+        print(f"    Fork synced with upstream {branch}")
+    else:
+        print(f"    Fork sync response: {resp.status_code} (may already be up to date)")
+
+
+def create_branch(repo: str, branch_name: str, from_branch: str = "main") -> bool:
+    """Create a new branch in the repo."""
+    # Get the SHA of the source branch
+    resp = requests.get(
+        f"{GH_API}/repos/{repo}/git/ref/heads/{from_branch}",
+        headers=GH_HEADERS,
+    )
+    if resp.status_code != 200:
+        print(f"    Failed to get ref for {from_branch}: {resp.status_code}")
+        return False
+
+    sha = resp.json()["object"]["sha"]
+
+    # Create the new branch
+    resp = requests.post(
+        f"{GH_API}/repos/{repo}/git/refs",
+        headers=GH_HEADERS,
+        json={"ref": f"refs/heads/{branch_name}", "sha": sha},
+    )
+    if resp.status_code == 201:
+        print(f"    Branch created: {branch_name}")
+        return True
+    elif resp.status_code == 422:
+        # Branch already exists — update it to the latest SHA
+        resp = requests.patch(
+            f"{GH_API}/repos/{repo}/git/refs/heads/{branch_name}",
+            headers=GH_HEADERS,
+            json={"sha": sha, "force": True},
+        )
+        if resp.status_code == 200:
+            print(f"    Branch reset: {branch_name}")
+            return True
+    print(f"    Failed to create branch: {resp.status_code} {resp.text}")
+    return False
+
+
+def commit_file(
+    repo: str,
+    path: str,
+    content: str,
+    message: str,
+    branch: str,
+    file_sha: str | None = None,
+) -> bool:
+    """Create or update a file in the repo via the Contents API."""
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if file_sha:
+        payload["sha"] = file_sha
+
+    resp = requests.put(
+        f"{GH_API}/repos/{repo}/contents/{path}",
+        headers=GH_HEADERS,
+        json=payload,
+    )
+    if resp.status_code in (200, 201):
+        print(f"    Committed: {path}")
+        return True
+    print(f"    Failed to commit {path}: {resp.status_code} {resp.text}")
+    return False
+
+
+def create_pull_request(
+    upstream_repo: str,
+    fork_owner: str,
+    branch: str,
+    title: str,
+    body: str,
+    base: str = "main",
+) -> str | None:
+    """Open a PR from fork:branch to upstream:base. Returns the PR URL."""
+    resp = requests.post(
+        f"{GH_API}/repos/{upstream_repo}/pulls",
+        headers=GH_HEADERS,
+        json={
+            "title": title,
+            "body": body,
+            "head": f"{fork_owner}:{branch}",
+            "base": base,
+        },
+    )
+    if resp.status_code == 201:
+        pr_url = resp.json()["html_url"]
+        print(f"    PR created: {pr_url}")
+        return pr_url
+    print(f"    Failed to create PR: {resp.status_code} {resp.text}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Issue creation (fallback when PRs are disabled)
+# ---------------------------------------------------------------------------
+
+
+def create_github_issue(title: str, body: str, labels: list[str] | None = None):
+    """Create an issue in THIS repo."""
+    if not THIS_REPO:
+        print(f"ISSUE (dry-run, no THIS_REPO set):\n  Title: {title}\n  Body:\n{body}\n")
+        return
+
+    url = f"{GH_API}/repos/{THIS_REPO}/issues"
+    payload = {"title": title, "body": body}
+    if labels:
+        payload["labels"] = labels
+    resp = requests.post(url, headers=GH_HEADERS, json=payload)
+    if resp.status_code == 201:
+        issue_url = resp.json()["html_url"]
+        print(f"Created issue: {issue_url}")
+    else:
+        print(f"Failed to create issue: {resp.status_code} {resp.text}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    print("=== Docs Impact Monitor ===")
+    print(f"Monitoring: {MONITORED_REPO} / {MONITORED_WORKFLOW}")
+    print(f"Lookback: {LOOKBACK_HOURS} hours")
+    print(f"PR creation: {'enabled' if CREATE_PRS else 'disabled (issue-only mode)'}")
+    if CREATE_PRS:
+        print(f"Fork owner: {FORK_OWNER or '(not set — PR creation will be skipped)'}")
+    print()
+
+    # Step 1: Get recent successful workflow runs
+    print("Step 1: Checking for recent workflow runs...")
+    runs = get_recent_workflow_runs()
+    if not runs:
+        print("No recent successful runs found. Nothing to do.")
+        return
+
+    print(f"Found {len(runs)} recent run(s)")
+
+    # Step 2: Extract PR numbers from the runs
+    print("\nStep 2: Extracting PR numbers from workflow runs...")
+    all_pr_numbers = set()
+    for run in runs:
+        pr_nums = extract_pr_numbers_from_run(run["id"])
+        if not pr_nums:
+            pr_nums = get_merged_prs_by_commits(run["head_sha"])
+        all_pr_numbers.update(pr_nums)
+        print(f"  Run #{run['id']}: {len(pr_nums)} PRs")
+
+    if not all_pr_numbers:
+        print("No PRs found in recent runs. Nothing to do.")
+        return
+
+    print(f"Total unique PRs: {len(all_pr_numbers)}")
+
+    # Step 3: Fetch PR details and release notes
+    print("\nStep 3: Fetching PR details and release notes...")
+    prs_with_notes = []
+    for pr_num in sorted(all_pr_numbers):
+        try:
+            pr = get_pr_details(pr_num)
+            notes = extract_release_notes(pr.get("body", "") or "")
+            if notes:
+                prs_with_notes.append(
+                    {
+                        "number": pr_num,
+                        "title": pr.get("title", ""),
+                        "author": pr.get("user", {}).get("login", "unknown"),
+                        "release_notes": notes,
+                        "html_url": pr.get("html_url", ""),
+                    }
+                )
+                print(f"  PR #{pr_num}: {pr.get('title', '')[:60]}...")
+        except Exception as e:
+            print(f"  PR #{pr_num}: Failed to fetch ({e})")
+
+    if not prs_with_notes:
+        print("No PRs with release notes found. Nothing to do.")
+        return
+
+    print(f"\nFound {len(prs_with_notes)} PR(s) with release notes")
+
+    # Step 4: Triage with Claude — which changes affect docs?
+    print("\nStep 4: Triaging release notes with Claude...")
+    impactful_changes = triage_release_notes(prs_with_notes)
+
+    if not impactful_changes:
+        print("No doc-affecting changes found. All clear!")
+        return
+
+    print(f"Found {len(impactful_changes)} potentially doc-affecting change(s)")
+    for change in impactful_changes:
+        print(f"  - PR #{change['pr_number']}: {change['change_summary']} [{change['change_type']}]")
+
+    # Step 5: Fetch the docs index
+    print("\nStep 5: Fetching docs index...")
+    docs_index = fetch_docs_index()
+    print(f"Docs index: {len(docs_index)} chars, ~{docs_index.count(chr(10))} lines")
+
+    # Step 6: For each impactful change, find affected docs and generate edits
+    print("\nStep 6: Identifying affected documentation pages...")
+    all_file_edits = []  # list of {change, source_pr, doc_url, repo_path, review, new_content, file_sha}
+    issues_to_create = []
+
+    for change in impactful_changes:
+        print(f"\n  Analyzing PR #{change['pr_number']}: {change['change_summary']}")
+        affected_docs = find_affected_docs(change, docs_index)
+
+        if not affected_docs:
+            print("    No docs affected")
+            continue
+
+        print(f"    Found {len(affected_docs)} potentially affected page(s)")
+
+        reviewed_docs = []
+        for doc in affected_docs[:5]:
+            doc_url = doc["doc_url"]
+            print(f"    Reviewing: {doc_url}")
+            try:
+                content = fetch_doc_page(doc_url)
+                review = review_doc_page(change, doc_url, content)
+                if "NO_UPDATE_NEEDED" not in review:
+                    reviewed_docs.append(
+                        {
+                            "url": doc_url,
+                            "title": doc.get("doc_title", ""),
+                            "urgency": doc.get("urgency", "medium"),
+                            "reason": doc.get("reason", ""),
+                            "review": review,
+                        }
+                    )
+                else:
+                    print(f"      -> No update needed")
+            except Exception as e:
+                print(f"      -> Failed to review ({e})")
+
+        if not reviewed_docs:
+            continue
+
+        source_pr = next(
+            (p for p in prs_with_notes if p["number"] == change["pr_number"]),
+            None,
+        )
+
+        # Step 7: Generate actual file edits if PR creation is enabled
+        if CREATE_PRS and FORK_OWNER:
+            print(f"\n  Step 7: Generating file edits for PR #{change['pr_number']}...")
+            for doc in reviewed_docs:
+                repo_path = doc_url_to_repo_path(doc["url"])
+                print(f"    Fetching source: {repo_path}")
+
+                file_data = get_repo_file(DOCS_REPO, repo_path)
+                if not file_data:
+                    print(f"      -> Source file not found in repo, skipping")
+                    continue
+
+                print(f"      Generating updated content...")
+                new_content = generate_doc_edit(
+                    change, doc["review"], file_data["content"]
+                )
+
+                if new_content and new_content != file_data["content"]:
+                    all_file_edits.append(
+                        {
+                            "change": change,
+                            "source_pr": source_pr,
+                            "doc_url": doc["url"],
+                            "repo_path": file_data["path"],  # Use actual path from API
+                            "review": doc["review"],
+                            "urgency": doc["urgency"],
+                            "new_content": new_content,
+                            "file_sha": file_data["sha"],
+                        }
+                    )
+                    print(f"      -> Edit generated ({len(new_content)} chars)")
+                else:
+                    print(f"      -> No changes produced")
+
+        # Collect for issue creation (used as fallback or alongside PRs)
+        issues_to_create.append(
+            {
+                "change": change,
+                "source_pr": source_pr,
+                "docs": reviewed_docs,
+            }
+        )
+
+    # Step 8: Create PRs with the doc edits
+    if CREATE_PRS and FORK_OWNER and all_file_edits:
+        print(f"\nStep 8: Creating PR with {len(all_file_edits)} file edit(s)...")
+
+        try:
+            # Ensure fork exists and is synced
+            fork_repo = ensure_fork(DOCS_REPO, FORK_OWNER)
+            sync_fork(fork_repo, DOCS_REPO)
+
+            # Create a branch for these changes
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            branch_name = f"docs-monitor/auto-update-{timestamp}"
+            if not create_branch(fork_repo, branch_name):
+                raise RuntimeError("Failed to create branch")
+
+            # Commit each file edit
+            committed_files = []
+            for edit in all_file_edits:
+                # Get the file SHA from the fork's branch (may differ from upstream)
+                fork_file = get_repo_file(fork_repo, edit["repo_path"], ref=branch_name)
+                file_sha = fork_file["sha"] if fork_file else edit["file_sha"]
+
+                success = commit_file(
+                    repo=fork_repo,
+                    path=edit["repo_path"],
+                    content=edit["new_content"],
+                    message=(
+                        f"docs: update {edit['repo_path']} for PR #{edit['change']['pr_number']}\n\n"
+                        f"Automated update based on: {edit['change']['change_summary']}"
+                    ),
+                    branch=branch_name,
+                    file_sha=file_sha,
+                )
+                if success:
+                    committed_files.append(edit)
+
+            if not committed_files:
+                print("    No files were committed. Skipping PR creation.")
+            else:
+                # Build PR body
+                pr_body_parts = [
+                    "## Summary",
+                    "",
+                    "Automated documentation updates triggered by recent release notes.",
+                    "",
+                    "### Changes",
+                    "",
+                ]
+
+                # Group edits by source PR
+                by_pr: dict[int, list] = {}
+                for edit in committed_files:
+                    pr_num = edit["change"]["pr_number"]
+                    by_pr.setdefault(pr_num, []).append(edit)
+
+                for pr_num, edits in by_pr.items():
+                    source = edits[0]["source_pr"]
+                    pr_link = source["html_url"] if source else f"#{pr_num}"
+                    pr_title = source["title"] if source else edits[0]["change"]["change_summary"]
+                    pr_body_parts.append(
+                        f"**Triggered by [{DOCS_REPO}#{pr_num}]({pr_link})**: {pr_title}"
+                    )
+                    for edit in edits:
+                        urgency_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
+                            edit["urgency"], "⚪"
+                        )
+                        pr_body_parts.append(
+                            f"- {urgency_emoji} `{edit['repo_path']}` — {edit['review'][:200]}"
+                        )
+                    pr_body_parts.append("")
+
+                pr_body_parts.extend(
+                    [
+                        "### Review notes",
+                        "",
+                        "This PR was automatically generated by the **Docs Impact Monitor**. "
+                        "Please review the changes carefully before merging.",
+                        "",
+                        "Each file edit was generated by Claude based on the release notes "
+                        "and a review of the existing documentation content.",
+                    ]
+                )
+
+                # Build a concise title
+                change_types = list({e["change"]["change_type"] for e in committed_files})
+                pr_title = f"docs: automated updates for {', '.join(change_types)}"
+                if len(pr_title) > 70:
+                    pr_title = f"docs: automated updates ({len(committed_files)} files)"
+
+                pr_url = create_pull_request(
+                    upstream_repo=DOCS_REPO,
+                    fork_owner=FORK_OWNER,
+                    branch=branch_name,
+                    title=pr_title,
+                    body="\n".join(pr_body_parts),
+                )
+
+                if pr_url:
+                    print(f"\n    PR created successfully: {pr_url}")
+
+        except Exception as e:
+            print(f"\n    PR creation failed: {e}")
+            print("    Falling back to issue creation...")
+            CREATE_PRS_FALLBACK = True
+    else:
+        CREATE_PRS_FALLBACK = True
+
+    # Step 8b: Create issues (fallback or when PRs are disabled)
+    if not CREATE_PRS or not FORK_OWNER or not all_file_edits:
+        if not issues_to_create:
+            print("\nNo documentation updates needed after deep review. All clear!")
+            return
+
+        print(f"\nStep 8: Creating {len(issues_to_create)} GitHub issue(s)...")
+
+        for item in issues_to_create:
+            change = item["change"]
+            source_pr = item["source_pr"]
+            docs = item["docs"]
+
+            pr_link = source_pr["html_url"] if source_pr else f"#{change['pr_number']}"
+            title = f"Docs review needed: {change['change_summary'][:80]}"
+
+            urgency_emoji = {"high": "\U0001f534", "medium": "\U0001f7e1", "low": "\U0001f7e2"}
+
+            body_parts = [
+                "## Triggered by",
+                f"**PR**: [{MONITORED_REPO}#{change['pr_number']}]({pr_link})",
+                f"**Change type**: `{change['change_type']}`",
+                f"**Summary**: {change['change_summary']}",
+                "",
+                "## Documentation pages to review",
+                "",
+            ]
+
+            for doc in docs:
+                emoji = urgency_emoji.get(doc["urgency"], "\u26aa")
+                body_parts.append(f"### {emoji} [{doc['title'] or doc['url']}]({doc['url']})")
+                body_parts.append(f"**Urgency**: {doc['urgency']}")
+                body_parts.append(f"**Why**: {doc['reason']}")
+                body_parts.append(f"\n<details><summary>Suggested changes</summary>\n")
+                body_parts.append(doc["review"])
+                body_parts.append(f"\n</details>\n")
+
+            body_parts.append("---")
+            body_parts.append(
+                "*This issue was automatically generated by the Docs Impact Monitor.*"
+            )
+
+            body = "\n".join(body_parts)
+            labels = ["docs-review", change["change_type"]]
+            create_github_issue(title, body, labels)
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()
