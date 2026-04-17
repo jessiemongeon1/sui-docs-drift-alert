@@ -51,23 +51,47 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 def get_recent_workflow_runs() -> list[dict]:
-    """Get completed runs of the monitored workflow within the lookback window."""
+    """Get completed runs of the monitored workflow within the lookback window.
+
+    Paginates through results until we pass the cutoff time.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     url = f"{GH_API}/repos/{MONITORED_REPO}/actions/workflows/{MONITORED_WORKFLOW}/runs"
-    params = {
-        "status": "completed",
-        "per_page": 10,
-        "branch": "main",
-    }
-    resp = requests.get(url, headers=GH_HEADERS, params=params)
-    resp.raise_for_status()
-    runs = resp.json().get("workflow_runs", [])
 
     recent = []
-    for run in runs:
-        run_time = datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
-        if run_time >= cutoff and run["conclusion"] == "success":
-            recent.append(run)
+    page = 1
+    while True:
+        params = {
+            "status": "completed",
+            "per_page": 100,
+            "branch": "main",
+            "page": page,
+        }
+        resp = requests.get(url, headers=GH_HEADERS, params=params)
+        resp.raise_for_status()
+        runs = resp.json().get("workflow_runs", [])
+
+        if not runs:
+            break
+
+        past_cutoff = False
+        for run in runs:
+            run_time = datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
+            if run_time < cutoff:
+                past_cutoff = True
+                break
+            if run["conclusion"] == "success":
+                recent.append(run)
+
+        if past_cutoff:
+            break
+
+        page += 1
+        # Safety cap — the API returns runs newest-first, so we stop
+        # once we've gone past the cutoff or hit a reasonable page limit.
+        if page > 20:
+            break
+
     return recent
 
 
@@ -274,7 +298,7 @@ def triage_release_notes(prs_with_notes: list[dict]) -> list[dict]:
         return []
 
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=4096,
         system=TRIAGE_SYSTEM,
         messages=[{"role": "user", "content": content}],
@@ -295,7 +319,7 @@ def triage_release_notes(prs_with_notes: list[dict]) -> list[dict]:
 def find_affected_docs(change: dict, docs_index: str) -> list[dict]:
     """Ask Claude which doc pages are affected by a specific change."""
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=4096,
         system=DOCS_MATCH_SYSTEM,
         messages=[
@@ -327,7 +351,7 @@ def find_affected_docs(change: dict, docs_index: str) -> list[dict]:
 def review_doc_page(change: dict, doc_url: str, doc_content: str) -> str:
     """Ask Claude to review a specific doc page against a change."""
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=2048,
         system=DOC_REVIEW_SYSTEM,
         messages=[
@@ -349,7 +373,7 @@ def review_doc_page(change: dict, doc_url: str, doc_content: str) -> str:
 def generate_doc_edit(change: dict, review: str, file_content: str) -> str:
     """Ask Claude to produce the updated file content."""
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=16384,
         system=DOC_EDIT_SYSTEM,
         messages=[
@@ -668,15 +692,25 @@ def main():
                 repo_path = doc_url_to_repo_path(doc["url"])
                 print(f"    Fetching source: {repo_path}")
 
-                file_data = get_repo_file(DOCS_REPO, repo_path)
-                if not file_data:
-                    print(f"      -> Source file not found in repo, skipping")
+                try:
+                    file_data = get_repo_file(DOCS_REPO, repo_path)
+                except Exception as e:
+                    print(f"      -> Error fetching file: {e}")
                     continue
 
-                print(f"      Generating updated content...")
-                new_content = generate_doc_edit(
-                    change, doc["review"], file_data["content"]
-                )
+                if not file_data:
+                    print(f"      -> Source file not found in repo (tried .md and .mdx), skipping")
+                    continue
+
+                print(f"      Found: {file_data['path']} ({len(file_data['content'])} chars)")
+                print(f"      Generating updated content with Claude...")
+                try:
+                    new_content = generate_doc_edit(
+                        change, doc["review"], file_data["content"]
+                    )
+                except Exception as e:
+                    print(f"      -> Claude edit generation failed: {e}")
+                    continue
 
                 if new_content and new_content != file_data["content"]:
                     all_file_edits.append(
@@ -684,7 +718,7 @@ def main():
                             "change": change,
                             "source_pr": source_pr,
                             "doc_url": doc["url"],
-                            "repo_path": file_data["path"],  # Use actual path from API
+                            "repo_path": file_data["path"],
                             "review": doc["review"],
                             "urgency": doc["urgency"],
                             "new_content": new_content,
@@ -693,7 +727,9 @@ def main():
                     )
                     print(f"      -> Edit generated ({len(new_content)} chars)")
                 else:
-                    print(f"      -> No changes produced")
+                    print(f"      -> No changes produced (content identical)")
+        else:
+            print(f"\n  [skip Step 7] CREATE_PRS={CREATE_PRS}, FORK_OWNER='{FORK_OWNER}'")
 
         # Collect for issue creation (used as fallback or alongside PRs)
         issues_to_create.append(
@@ -704,120 +740,123 @@ def main():
             }
         )
 
-    # Step 8: Create PRs with the doc edits
-    if CREATE_PRS and FORK_OWNER and all_file_edits:
-        print(f"\nStep 8: Creating PR with {len(all_file_edits)} file edit(s)...")
+    # Step 8: Create PR or fall back to issues
+    pr_created = False
 
-        try:
-            # Ensure fork exists and is synced
-            fork_repo = ensure_fork(DOCS_REPO, FORK_OWNER)
-            sync_fork(fork_repo, DOCS_REPO)
+    if CREATE_PRS and FORK_OWNER:
+        print(f"\n  [debug] all_file_edits count: {len(all_file_edits)}")
+        print(f"  [debug] issues_to_create count: {len(issues_to_create)}")
+        if all_file_edits:
+            print(f"\nStep 8: Creating PR with {len(all_file_edits)} file edit(s)...")
 
-            # Create a branch for these changes
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-            branch_name = f"docs-monitor/auto-update-{timestamp}"
-            if not create_branch(fork_repo, branch_name):
-                raise RuntimeError("Failed to create branch")
+            try:
+                fork_repo = ensure_fork(DOCS_REPO, FORK_OWNER)
+                sync_fork(fork_repo, DOCS_REPO)
 
-            # Commit each file edit
-            committed_files = []
-            for edit in all_file_edits:
-                # Get the file SHA from the fork's branch (may differ from upstream)
-                fork_file = get_repo_file(fork_repo, edit["repo_path"], ref=branch_name)
-                file_sha = fork_file["sha"] if fork_file else edit["file_sha"]
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                branch_name = f"docs-monitor/auto-update-{timestamp}"
+                if not create_branch(fork_repo, branch_name):
+                    raise RuntimeError("Failed to create branch")
 
-                success = commit_file(
-                    repo=fork_repo,
-                    path=edit["repo_path"],
-                    content=edit["new_content"],
-                    message=(
-                        f"docs: update {edit['repo_path']} for PR #{edit['change']['pr_number']}\n\n"
-                        f"Automated update based on: {edit['change']['change_summary']}"
-                    ),
-                    branch=branch_name,
-                    file_sha=file_sha,
-                )
-                if success:
-                    committed_files.append(edit)
+                committed_files = []
+                for edit in all_file_edits:
+                    fork_file = get_repo_file(fork_repo, edit["repo_path"], ref=branch_name)
+                    file_sha = fork_file["sha"] if fork_file else edit["file_sha"]
 
-            if not committed_files:
-                print("    No files were committed. Skipping PR creation.")
-            else:
-                # Build PR body
-                pr_body_parts = [
-                    "## Summary",
-                    "",
-                    "Automated documentation updates triggered by recent release notes.",
-                    "",
-                    "### Changes",
-                    "",
-                ]
-
-                # Group edits by source PR
-                by_pr: dict[int, list] = {}
-                for edit in committed_files:
-                    pr_num = edit["change"]["pr_number"]
-                    by_pr.setdefault(pr_num, []).append(edit)
-
-                for pr_num, edits in by_pr.items():
-                    source = edits[0]["source_pr"]
-                    pr_link = source["html_url"] if source else f"#{pr_num}"
-                    pr_title = source["title"] if source else edits[0]["change"]["change_summary"]
-                    pr_body_parts.append(
-                        f"**Triggered by [{DOCS_REPO}#{pr_num}]({pr_link})**: {pr_title}"
+                    success = commit_file(
+                        repo=fork_repo,
+                        path=edit["repo_path"],
+                        content=edit["new_content"],
+                        message=(
+                            f"docs: update {edit['repo_path']} for PR #{edit['change']['pr_number']}\n\n"
+                            f"Automated update based on: {edit['change']['change_summary']}"
+                        ),
+                        branch=branch_name,
+                        file_sha=file_sha,
                     )
-                    for edit in edits:
-                        urgency_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
-                            edit["urgency"], "⚪"
-                        )
-                        pr_body_parts.append(
-                            f"- {urgency_emoji} `{edit['repo_path']}` — {edit['review'][:200]}"
-                        )
-                    pr_body_parts.append("")
+                    if success:
+                        committed_files.append(edit)
 
-                pr_body_parts.extend(
-                    [
-                        "### Review notes",
+                if committed_files:
+                    pr_body_parts = [
+                        "## Summary",
                         "",
-                        "This PR was automatically generated by the **Docs Impact Monitor**. "
-                        "Please review the changes carefully before merging.",
+                        "Automated documentation updates triggered by recent release notes.",
                         "",
-                        "Each file edit was generated by Claude based on the release notes "
-                        "and a review of the existing documentation content.",
+                        "### Changes",
+                        "",
                     ]
-                )
 
-                # Build a concise title
-                change_types = list({e["change"]["change_type"] for e in committed_files})
-                pr_title = f"docs: automated updates for {', '.join(change_types)}"
-                if len(pr_title) > 70:
-                    pr_title = f"docs: automated updates ({len(committed_files)} files)"
+                    by_pr: dict[int, list] = {}
+                    for edit in committed_files:
+                        pr_num = edit["change"]["pr_number"]
+                        by_pr.setdefault(pr_num, []).append(edit)
 
-                pr_url = create_pull_request(
-                    upstream_repo=DOCS_REPO,
-                    fork_owner=FORK_OWNER,
-                    branch=branch_name,
-                    title=pr_title,
-                    body="\n".join(pr_body_parts),
-                )
+                    for pr_num, edits in by_pr.items():
+                        source = edits[0]["source_pr"]
+                        pr_link = source["html_url"] if source else f"#{pr_num}"
+                        pr_title = source["title"] if source else edits[0]["change"]["change_summary"]
+                        pr_body_parts.append(
+                            f"**Triggered by [{DOCS_REPO}#{pr_num}]({pr_link})**: {pr_title}"
+                        )
+                        for edit in edits:
+                            urgency_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(
+                                edit["urgency"], "⚪"
+                            )
+                            pr_body_parts.append(
+                                f"- {urgency_emoji} `{edit['repo_path']}` — {edit['review'][:200]}"
+                            )
+                        pr_body_parts.append("")
 
-                if pr_url:
-                    print(f"\n    PR created successfully: {pr_url}")
+                    pr_body_parts.extend(
+                        [
+                            "### Review notes",
+                            "",
+                            "This PR was automatically generated by the **Docs Impact Monitor**. "
+                            "Please review the changes carefully before merging.",
+                            "",
+                            "Each file edit was generated by Claude based on the release notes "
+                            "and a review of the existing documentation content.",
+                        ]
+                    )
 
-        except Exception as e:
-            print(f"\n    PR creation failed: {e}")
-            print("    Falling back to issue creation...")
-            CREATE_PRS_FALLBACK = True
-    else:
-        CREATE_PRS_FALLBACK = True
+                    change_types = list({e["change"]["change_type"] for e in committed_files})
+                    pr_title = f"docs: automated updates for {', '.join(change_types)}"
+                    if len(pr_title) > 70:
+                        pr_title = f"docs: automated updates ({len(committed_files)} files)"
 
-    # Step 8b: Create issues (fallback or when PRs are disabled)
-    if not CREATE_PRS or not FORK_OWNER or not all_file_edits:
+                    pr_url = create_pull_request(
+                        upstream_repo=DOCS_REPO,
+                        fork_owner=FORK_OWNER,
+                        branch=branch_name,
+                        title=pr_title,
+                        body="\n".join(pr_body_parts),
+                    )
+
+                    if pr_url:
+                        print(f"\n    PR created successfully: {pr_url}")
+                        pr_created = True
+                    else:
+                        print("    PR creation API call failed.")
+                else:
+                    print("    No files were committed.")
+
+            except Exception as e:
+                print(f"\n    PR creation failed: {e}")
+                print("    Falling back to issue creation...")
+        else:
+            print("\nStep 8: No file edits were generated. Falling back to issue creation...")
+
+    elif CREATE_PRS and not FORK_OWNER:
+        print("\nStep 8: FORK_OWNER not set — cannot create PRs. Falling back to issues...")
+
+    # Step 8b: Create issues as fallback
+    if not pr_created:
         if not issues_to_create:
             print("\nNo documentation updates needed after deep review. All clear!")
             return
 
-        print(f"\nStep 8: Creating {len(issues_to_create)} GitHub issue(s)...")
+        print(f"\nStep 8b: Creating {len(issues_to_create)} GitHub issue(s)...")
 
         for item in issues_to_create:
             change = item["change"]
