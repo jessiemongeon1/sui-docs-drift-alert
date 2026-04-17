@@ -1,4 +1,6 @@
-# Docs Drift Alert
+# Docs Changelog Monitor
+
+<img src="icon.jpeg" alt="Docs Changelog Monitor" />
 
 Automated CI pipeline that monitors multiple Mysten Labs repositories for code changes that affect documentation, generates fixes following the [Sui Style Guide](https://docs.sui.io/references/contribute/style-guide), and opens PRs.
 
