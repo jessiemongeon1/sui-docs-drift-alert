@@ -36,9 +36,22 @@ DOCS_REPO_PATH_PREFIX = os.environ.get("DOCS_REPO_PATH_PREFIX", "docs/content")
 FORK_OWNER = os.environ.get("FORK_OWNER", "")  # GitHub user/org to fork under
 CREATE_PRS = os.environ.get("CREATE_PRS", "true").lower() == "true"
 
+# PAT for write operations (fork, push, create PRs) — falls back to GITHUB_TOKEN
+DOCS_MONITOR_PAT = os.environ.get("DOCS_MONITOR_PAT", "")
+
 GH_API = "https://api.github.com"
-GH_HEADERS = {
+
+# Read-only headers — uses the Actions-provided GITHUB_TOKEN (works on public repos)
+GH_READ_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+
+# Write headers — uses the PAT for fork/push/PR operations on external repos
+_write_token = DOCS_MONITOR_PAT or GITHUB_TOKEN
+GH_WRITE_HEADERS = {
+    "Authorization": f"Bearer {_write_token}",
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
 }
@@ -67,7 +80,7 @@ def get_recent_workflow_runs() -> list[dict]:
             "branch": "main",
             "page": page,
         }
-        resp = requests.get(url, headers=GH_HEADERS, params=params)
+        resp = requests.get(url, headers=GH_READ_HEADERS, params=params)
         resp.raise_for_status()
         runs = resp.json().get("workflow_runs", [])
 
@@ -99,7 +112,7 @@ def get_workflow_run_jobs(run_id: int) -> list[dict]:
     """Get jobs for a workflow run to extract PR numbers from job names."""
     url = f"{GH_API}/repos/{MONITORED_REPO}/actions/runs/{run_id}/jobs"
     params = {"per_page": 100}
-    resp = requests.get(url, headers=GH_HEADERS, params=params)
+    resp = requests.get(url, headers=GH_READ_HEADERS, params=params)
     resp.raise_for_status()
     return resp.json().get("jobs", [])
 
@@ -120,7 +133,7 @@ def extract_pr_numbers_from_run(run_id: int) -> list[int]:
 def get_pr_details(pr_number: int) -> dict:
     """Fetch PR title, body, and author."""
     url = f"{GH_API}/repos/{MONITORED_REPO}/pulls/{pr_number}"
-    resp = requests.get(url, headers=GH_HEADERS)
+    resp = requests.get(url, headers=GH_READ_HEADERS)
     resp.raise_for_status()
     return resp.json()
 
@@ -147,7 +160,7 @@ def extract_release_notes(pr_body: str) -> str:
 def get_merged_prs_by_commits(head_sha: str) -> list[int]:
     """Fallback: find recently merged PRs associated with commits near head_sha."""
     url = f"{GH_API}/repos/{MONITORED_REPO}/commits/{head_sha}/pulls"
-    resp = requests.get(url, headers=GH_HEADERS)
+    resp = requests.get(url, headers=GH_READ_HEADERS)
     if resp.status_code == 200:
         return [pr["number"] for pr in resp.json() if pr.get("merged_at")]
     return []
@@ -193,7 +206,7 @@ def get_repo_file(repo: str, path: str, ref: str = "main") -> dict | None:
     """Fetch a file from a GitHub repo. Returns dict with 'content', 'sha', 'path'."""
     url = f"{GH_API}/repos/{repo}/contents/{path}"
     params = {"ref": ref}
-    resp = requests.get(url, headers=GH_HEADERS, params=params)
+    resp = requests.get(url, headers=GH_READ_HEADERS, params=params)
     if resp.status_code == 200:
         data = resp.json()
         content = base64.b64decode(data["content"]).decode("utf-8")
@@ -403,7 +416,7 @@ def ensure_fork(upstream_repo: str, fork_owner: str) -> str:
     fork_full = f"{fork_owner}/{repo_name}"
 
     # Check if fork already exists
-    resp = requests.get(f"{GH_API}/repos/{fork_full}", headers=GH_HEADERS)
+    resp = requests.get(f"{GH_API}/repos/{fork_full}", headers=GH_READ_HEADERS)
     if resp.status_code == 200:
         print(f"    Fork exists: {fork_full}")
         return fork_full
@@ -412,7 +425,7 @@ def ensure_fork(upstream_repo: str, fork_owner: str) -> str:
     print(f"    Creating fork of {upstream_repo}...")
     resp = requests.post(
         f"{GH_API}/repos/{upstream_repo}/forks",
-        headers=GH_HEADERS,
+        headers=GH_WRITE_HEADERS,
         json={"organization": fork_owner} if "/" not in fork_owner else {},
     )
     if resp.status_code in (200, 202):
@@ -421,7 +434,7 @@ def ensure_fork(upstream_repo: str, fork_owner: str) -> str:
         # Wait for fork to be ready
         for _ in range(10):
             time.sleep(3)
-            check = requests.get(f"{GH_API}/repos/{fork_full}", headers=GH_HEADERS)
+            check = requests.get(f"{GH_API}/repos/{fork_full}", headers=GH_READ_HEADERS)
             if check.status_code == 200:
                 break
         return fork_full
@@ -433,7 +446,7 @@ def sync_fork(fork_repo: str, upstream_repo: str, branch: str = "main"):
     """Sync the fork's default branch with upstream."""
     resp = requests.post(
         f"{GH_API}/repos/{fork_repo}/merge-upstream",
-        headers=GH_HEADERS,
+        headers=GH_WRITE_HEADERS,
         json={"branch": branch},
     )
     if resp.status_code == 200:
@@ -447,7 +460,7 @@ def create_branch(repo: str, branch_name: str, from_branch: str = "main") -> boo
     # Get the SHA of the source branch
     resp = requests.get(
         f"{GH_API}/repos/{repo}/git/ref/heads/{from_branch}",
-        headers=GH_HEADERS,
+        headers=GH_READ_HEADERS,
     )
     if resp.status_code != 200:
         print(f"    Failed to get ref for {from_branch}: {resp.status_code}")
@@ -458,7 +471,7 @@ def create_branch(repo: str, branch_name: str, from_branch: str = "main") -> boo
     # Create the new branch
     resp = requests.post(
         f"{GH_API}/repos/{repo}/git/refs",
-        headers=GH_HEADERS,
+        headers=GH_WRITE_HEADERS,
         json={"ref": f"refs/heads/{branch_name}", "sha": sha},
     )
     if resp.status_code == 201:
@@ -468,7 +481,7 @@ def create_branch(repo: str, branch_name: str, from_branch: str = "main") -> boo
         # Branch already exists — update it to the latest SHA
         resp = requests.patch(
             f"{GH_API}/repos/{repo}/git/refs/heads/{branch_name}",
-            headers=GH_HEADERS,
+            headers=GH_WRITE_HEADERS,
             json={"sha": sha, "force": True},
         )
         if resp.status_code == 200:
@@ -497,7 +510,7 @@ def commit_file(
 
     resp = requests.put(
         f"{GH_API}/repos/{repo}/contents/{path}",
-        headers=GH_HEADERS,
+        headers=GH_WRITE_HEADERS,
         json=payload,
     )
     if resp.status_code in (200, 201):
@@ -518,7 +531,7 @@ def create_pull_request(
     """Open a PR from fork:branch to upstream:base. Returns the PR URL."""
     resp = requests.post(
         f"{GH_API}/repos/{upstream_repo}/pulls",
-        headers=GH_HEADERS,
+        headers=GH_WRITE_HEADERS,
         json={
             "title": title,
             "body": body,
@@ -549,7 +562,7 @@ def create_github_issue(title: str, body: str, labels: list[str] | None = None):
     payload = {"title": title, "body": body}
     if labels:
         payload["labels"] = labels
-    resp = requests.post(url, headers=GH_HEADERS, json=payload)
+    resp = requests.post(url, headers=GH_WRITE_HEADERS, json=payload)
     if resp.status_code == 201:
         issue_url = resp.json()["html_url"]
         print(f"Created issue: {issue_url}")
@@ -744,6 +757,16 @@ def main():
     pr_created = False
 
     if CREATE_PRS and FORK_OWNER:
+        # Deduplicate: if multiple changes affect the same file, keep only the last
+        # edit (which was generated with the most recent file state).
+        seen_paths = {}
+        for edit in all_file_edits:
+            path = edit["repo_path"]
+            if path in seen_paths:
+                print(f"  [dedup] {path} edited by multiple PRs — merging into single edit")
+            seen_paths[path] = edit
+        all_file_edits = list(seen_paths.values())
+
         print(f"\n  [debug] all_file_edits count: {len(all_file_edits)}")
         print(f"  [debug] issues_to_create count: {len(issues_to_create)}")
         if all_file_edits:

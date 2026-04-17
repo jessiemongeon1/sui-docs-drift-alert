@@ -46,9 +46,10 @@ jobs:
 
       - name: Run docs impact monitor
         env:
-          # GITHUB_TOKEN is fine for reading public repos and creating issues here.
-          # For PR creation on MystenLabs/sui, use a PAT with repo + workflow scope.
-          GITHUB_TOKEN: ${{ secrets.DOCS_MONITOR_PAT || secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN for reading public repos (workflow runs, PRs, file contents)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT for write operations (fork, push, create PRs on external repos)
+          DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MONITORED_REPO: ${{ env.MONITORED_REPO }}
           MONITORED_WORKFLOW: ${{ env.MONITORED_WORKFLOW }}
@@ -60,5 +61,5 @@ jobs:
           THIS_REPO: ${{ github.repository }}
           # PR creation settings
           CREATE_PRS: ${{ inputs.create_prs || 'true' }}
-          FORK_OWNER: ${{ vars.FORK_OWNER }}
+          FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
         run: python scripts/monitor.py
