@@ -12,24 +12,19 @@ on:
         required: false
         default: 'true'
   schedule:
-    - cron: '30 1,7,13,19 * * *'  # Every 6 hours, offset from the source's 3-hour cycle
+    - cron: '30 1,7,13,19 * * *'  # Every 6 hours
 
 permissions:
   contents: read
   issues: write
   actions: write
 
-env:
-  MONITORED_REPO: MystenLabs/sui
-  MONITORED_WORKFLOW: release-notes-monitor.yml
-  DOCS_LLMS_URL: https://docs.sui.io/llms.txt
-  DOCS_BASE_URL: https://docs.sui.io
-  DOCS_REPO: MystenLabs/sui
-  DOCS_REPO_PATH_PREFIX: docs/content
-
 jobs:
-  monitor-release-notes:
-    name: Monitor Release Notes & Flag Docs
+  # -----------------------------------------------------------------------
+  # Sui docs monitor
+  # -----------------------------------------------------------------------
+  sui-docs:
+    name: Sui Docs Monitor
     runs-on: ubuntu-latest
 
     steps:
@@ -44,22 +39,176 @@ jobs:
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
 
-      - name: Run docs impact monitor
+      - name: Run Sui docs monitor
+        id: sui
         env:
-          # GITHUB_TOKEN for reading public repos (workflow runs, PRs, file contents)
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # PAT for write operations (fork, push, create PRs on external repos)
           DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MONITORED_REPO: ${{ env.MONITORED_REPO }}
-          MONITORED_WORKFLOW: ${{ env.MONITORED_WORKFLOW }}
-          DOCS_LLMS_URL: ${{ env.DOCS_LLMS_URL }}
-          DOCS_BASE_URL: ${{ env.DOCS_BASE_URL }}
-          DOCS_REPO: ${{ env.DOCS_REPO }}
-          DOCS_REPO_PATH_PREFIX: ${{ env.DOCS_REPO_PATH_PREFIX }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MONITORED_REPO: MystenLabs/sui
+          MONITORED_WORKFLOW: release-notes-monitor.yml
+          SCAN_MODE: workflow_runs
+          DOCS_LLMS_URL: https://docs.sui.io/llms.txt
+          DOCS_BASE_URL: https://docs.sui.io
+          DOCS_REPO: MystenLabs/sui
+          DOCS_REPO_PATH_PREFIX: docs/content
           LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}
           THIS_REPO: ${{ github.repository }}
-          # PR creation settings
+          CREATE_PRS: ${{ inputs.create_prs || 'true' }}
+          FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
+        run: python scripts/monitor.py
+
+  # -----------------------------------------------------------------------
+  # Move book monitor (Sui PRs that affect Move language docs)
+  # -----------------------------------------------------------------------
+  move-book:
+    name: Move Book Monitor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run Move book monitor
+        id: move-book
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MONITORED_REPO: MystenLabs/sui
+          MONITORED_WORKFLOW: release-notes-monitor.yml
+          SCAN_MODE: workflow_runs
+          DOCS_LLMS_URL: https://move-book.com/llms.txt
+          DOCS_BASE_URL: https://move-book.com
+          DOCS_REPO: MystenLabs/move-book
+          DOCS_REPO_PATH_PREFIX: book
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}
+          THIS_REPO: ${{ github.repository }}
+          CREATE_PRS: ${{ inputs.create_prs || 'true' }}
+          FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
+        run: python scripts/monitor.py
+
+  # -----------------------------------------------------------------------
+  # Walrus docs monitor
+  # -----------------------------------------------------------------------
+  walrus-docs:
+    name: Walrus Docs Monitor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run Walrus docs monitor
+        id: walrus
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MONITORED_REPO: MystenLabs/walrus
+          MONITORED_WORKFLOW: release-notes.yml
+          SCAN_MODE: merged_prs
+          DOCS_LLMS_URL: https://docs.wal.app/llms.txt
+          DOCS_BASE_URL: https://docs.wal.app
+          DOCS_REPO: MystenLabs/walrus
+          DOCS_REPO_PATH_PREFIX: docs/content
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}
+          THIS_REPO: ${{ github.repository }}
+          CREATE_PRS: ${{ inputs.create_prs || 'true' }}
+          FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
+        run: python scripts/monitor.py
+
+  # -----------------------------------------------------------------------
+  # Seal docs monitor
+  # -----------------------------------------------------------------------
+  seal-docs:
+    name: Seal Docs Monitor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run Seal docs monitor
+        id: seal
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MONITORED_REPO: MystenLabs/seal
+          SCAN_MODE: merged_prs
+          DOCS_LLMS_URL: https://seal-docs.wal.app/llms.txt
+          DOCS_BASE_URL: https://seal-docs.wal.app
+          DOCS_REPO: MystenLabs/seal
+          DOCS_REPO_PATH_PREFIX: docs/content
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}
+          THIS_REPO: ${{ github.repository }}
+          CREATE_PRS: ${{ inputs.create_prs || 'true' }}
+          FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
+        run: python scripts/monitor.py
+
+  # -----------------------------------------------------------------------
+  # SuiNS docs monitor
+  # -----------------------------------------------------------------------
+  suins-docs:
+    name: SuiNS Docs Monitor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run SuiNS docs monitor
+        id: suins
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MONITORED_REPO: MystenLabs/suins-contracts
+          SCAN_MODE: merged_prs
+          DOCS_LLMS_URL: https://docs.suins.io/llms.txt
+          DOCS_BASE_URL: https://docs.suins.io
+          DOCS_REPO: MystenLabs/suins-contracts
+          DOCS_REPO_PATH_PREFIX: documentation/content
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}
+          THIS_REPO: ${{ github.repository }}
           CREATE_PRS: ${{ inputs.create_prs || 'true' }}
           FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
         run: python scripts/monitor.py

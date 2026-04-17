@@ -30,6 +30,17 @@ DOCS_BASE_URL = os.environ.get("DOCS_BASE_URL", "https://docs.sui.io")
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "6"))
 THIS_REPO = os.environ.get("THIS_REPO", "")
 
+# Slack notification
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+
+# When set to "merged_prs", skip workflow run scanning and directly scan
+# recently merged PRs. Useful for repos whose release-notes workflow runs
+# on PRs (not on a schedule), like Walrus.
+SCAN_MODE = os.environ.get("SCAN_MODE", "workflow_runs")  # "workflow_runs" or "merged_prs"
+
+# GitHub Actions output file for passing data between steps
+GITHUB_OUTPUT = os.environ.get("GITHUB_OUTPUT", "")
+
 # PR creation config
 DOCS_REPO = os.environ.get("DOCS_REPO", "MystenLabs/sui")
 DOCS_REPO_PATH_PREFIX = os.environ.get("DOCS_REPO_PATH_PREFIX", "docs/content")
@@ -166,16 +177,91 @@ def get_merged_prs_by_commits(head_sha: str) -> list[int]:
     return []
 
 
+def get_recently_merged_prs() -> list[int]:
+    """Scan for recently merged PRs directly (used when SCAN_MODE=merged_prs).
+
+    This is for repos like Walrus where the release-notes workflow runs on PRs
+    rather than on a schedule, so we can't extract PR numbers from workflow runs.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    pr_numbers = []
+    page = 1
+
+    while True:
+        url = f"{GH_API}/repos/{MONITORED_REPO}/pulls"
+        params = {
+            "state": "closed",
+            "sort": "updated",
+            "direction": "desc",
+            "per_page": 100,
+            "page": page,
+        }
+        resp = requests.get(url, headers=GH_READ_HEADERS, params=params)
+        resp.raise_for_status()
+        pulls = resp.json()
+
+        if not pulls:
+            break
+
+        past_cutoff = False
+        for pr in pulls:
+            if not pr.get("merged_at"):
+                continue
+            merged_time = datetime.fromisoformat(pr["merged_at"].replace("Z", "+00:00"))
+            if merged_time < cutoff:
+                past_cutoff = True
+                break
+            pr_numbers.append(pr["number"])
+
+        if past_cutoff:
+            break
+        page += 1
+        if page > 10:
+            break
+
+    return pr_numbers
+
+
 # ---------------------------------------------------------------------------
 # Docs helpers
 # ---------------------------------------------------------------------------
 
 
 def fetch_docs_index() -> str:
-    """Fetch the llms.txt docs index."""
+    """Fetch the llms.txt docs index.
+
+    Falls back to scanning the docs repo directory tree via the GitHub API
+    if the llms.txt URL is unavailable (e.g. 403 for Walrus).
+    """
     resp = requests.get(DOCS_LLMS_URL, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+    if resp.status_code == 200:
+        return resp.text
+
+    print(f"  llms.txt unavailable ({resp.status_code}), building index from repo...")
+    return build_docs_index_from_repo()
+
+
+def build_docs_index_from_repo() -> str:
+    """Build a docs index by listing files in the docs repo via GitHub API."""
+    index_lines = [f"# {MONITORED_REPO} Documentation Index", ""]
+
+    def list_tree(path: str):
+        url = f"{GH_API}/repos/{DOCS_REPO}/contents/{path}"
+        resp = requests.get(url, headers=GH_READ_HEADERS, params={"ref": "main"})
+        if resp.status_code != 200:
+            return
+        for item in resp.json():
+            if item["type"] == "dir":
+                list_tree(item["path"])
+            elif item["name"].endswith((".md", ".mdx")):
+                # Build a browsable URL
+                rel_path = item["path"].replace(DOCS_REPO_PATH_PREFIX + "/", "", 1)
+                doc_url = f"{DOCS_BASE_URL}/{rel_path}"
+                title = rel_path.replace("/", " > ").replace(".mdx", "").replace(".md", "")
+                index_lines.append(f"- [{title}]({doc_url})")
+
+    list_tree(DOCS_REPO_PATH_PREFIX)
+    return "\n".join(index_lines)
 
 
 def fetch_doc_page(url: str) -> str:
@@ -571,40 +657,100 @@ def create_github_issue(title: str, body: str, labels: list[str] | None = None):
 
 
 # ---------------------------------------------------------------------------
+# Slack & output helpers
+# ---------------------------------------------------------------------------
+
+
+def set_github_output(key: str, value: str):
+    """Write a key=value pair to $GITHUB_OUTPUT for use in subsequent steps."""
+    if GITHUB_OUTPUT:
+        with open(GITHUB_OUTPUT, "a") as f:
+            f.write(f"{key}={value}\n")
+
+
+def send_slack_notification(pr_url: str, summary: str):
+    """Post a notification to Slack via webhook."""
+    if not SLACK_WEBHOOK_URL:
+        print("  [slack] No SLACK_WEBHOOK_URL set, skipping notification")
+        return
+
+    payload = {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"Docs Impact Monitor — {MONITORED_REPO}",
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": summary,
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*<{pr_url}|View PR>*",
+                },
+            },
+        ],
+    }
+
+    resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+    if resp.status_code == 200:
+        print(f"  [slack] Notification sent")
+    else:
+        print(f"  [slack] Failed: {resp.status_code} {resp.text}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 def main():
     print("=== Docs Impact Monitor ===")
-    print(f"Monitoring: {MONITORED_REPO} / {MONITORED_WORKFLOW}")
+    print(f"Monitoring: {MONITORED_REPO}")
+    print(f"Scan mode: {SCAN_MODE}")
+    if SCAN_MODE == "workflow_runs":
+        print(f"Workflow: {MONITORED_WORKFLOW}")
     print(f"Lookback: {LOOKBACK_HOURS} hours")
     print(f"PR creation: {'enabled' if CREATE_PRS else 'disabled (issue-only mode)'}")
     if CREATE_PRS:
         print(f"Fork owner: {FORK_OWNER or '(not set — PR creation will be skipped)'}")
     print()
 
-    # Step 1: Get recent successful workflow runs
-    print("Step 1: Checking for recent workflow runs...")
-    runs = get_recent_workflow_runs()
-    if not runs:
-        print("No recent successful runs found. Nothing to do.")
-        return
-
-    print(f"Found {len(runs)} recent run(s)")
-
-    # Step 2: Extract PR numbers from the runs
-    print("\nStep 2: Extracting PR numbers from workflow runs...")
+    # Step 1-2: Get PR numbers (mode-dependent)
     all_pr_numbers = set()
-    for run in runs:
-        pr_nums = extract_pr_numbers_from_run(run["id"])
-        if not pr_nums:
-            pr_nums = get_merged_prs_by_commits(run["head_sha"])
+
+    if SCAN_MODE == "merged_prs":
+        print("Step 1: Scanning recently merged PRs...")
+        pr_nums = get_recently_merged_prs()
         all_pr_numbers.update(pr_nums)
-        print(f"  Run #{run['id']}: {len(pr_nums)} PRs")
+        print(f"Found {len(pr_nums)} recently merged PR(s)")
+    else:
+        print("Step 1: Checking for recent workflow runs...")
+        runs = get_recent_workflow_runs()
+        if not runs:
+            print("No recent successful runs found. Nothing to do.")
+            return
+
+        print(f"Found {len(runs)} recent run(s)")
+
+        print("\nStep 2: Extracting PR numbers from workflow runs...")
+        for run in runs:
+            pr_nums = extract_pr_numbers_from_run(run["id"])
+            if not pr_nums:
+                pr_nums = get_merged_prs_by_commits(run["head_sha"])
+            all_pr_numbers.update(pr_nums)
+            print(f"  Run #{run['id']}: {len(pr_nums)} PRs")
 
     if not all_pr_numbers:
-        print("No PRs found in recent runs. Nothing to do.")
+        print("No PRs found. Nothing to do.")
         return
 
     print(f"Total unique PRs: {len(all_pr_numbers)}")
@@ -869,6 +1015,17 @@ def main():
                     if pr_url:
                         print(f"\n    PR created successfully: {pr_url}")
                         pr_created = True
+                        set_github_output("pr_url", pr_url)
+
+                        # Build Slack summary
+                        file_list = "\n".join(
+                            f"• `{e['repo_path']}`" for e in committed_files
+                        )
+                        slack_summary = (
+                            f"*{len(committed_files)} doc(s) updated* "
+                            f"for `{MONITORED_REPO}`\n{file_list}"
+                        )
+                        send_slack_notification(pr_url, slack_summary)
                     else:
                         print("    PR creation API call failed.")
                 else:
