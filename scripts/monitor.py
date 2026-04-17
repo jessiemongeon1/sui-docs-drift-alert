@@ -507,13 +507,21 @@ def ensure_fork(upstream_repo: str, fork_owner: str) -> str:
         print(f"    Fork exists: {fork_full}")
         return fork_full
 
-    # Create fork
+    # Create fork — first try without organization (forks to the PAT owner's account).
+    # If FORK_OWNER is an org, retry with the organization field.
     print(f"    Creating fork of {upstream_repo}...")
     resp = requests.post(
         f"{GH_API}/repos/{upstream_repo}/forks",
         headers=GH_WRITE_HEADERS,
-        json={"organization": fork_owner} if "/" not in fork_owner else {},
+        json={},
     )
+    # If the PAT owner differs from FORK_OWNER (i.e. FORK_OWNER is an org), retry
+    if resp.status_code == 422:
+        resp = requests.post(
+            f"{GH_API}/repos/{upstream_repo}/forks",
+            headers=GH_WRITE_HEADERS,
+            json={"organization": fork_owner},
+        )
     if resp.status_code in (200, 202):
         fork_full = resp.json()["full_name"]
         print(f"    Fork created: {fork_full}")
@@ -1085,6 +1093,21 @@ def main():
             body = "\n".join(body_parts)
             labels = ["docs-review", change["change_type"]]
             create_github_issue(title, body, labels)
+
+        # Notify Slack about issues created
+        issue_summaries = []
+        for item in issues_to_create:
+            change = item["change"]
+            doc_list = ", ".join(d["url"].split("/")[-1] for d in item["docs"][:3])
+            issue_summaries.append(
+                f"• PR #{change['pr_number']}: {change['change_summary'][:80]} ({doc_list})"
+            )
+        slack_summary = (
+            f"*{len(issues_to_create)} docs issue(s) created* "
+            f"for `{MONITORED_REPO}`\n" + "\n".join(issue_summaries)
+        )
+        repo_url = f"https://github.com/{THIS_REPO}/issues" if THIS_REPO else ""
+        send_slack_notification(repo_url, slack_summary)
 
     print("\nDone!")
 
