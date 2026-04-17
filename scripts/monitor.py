@@ -376,9 +376,60 @@ Rules:
 - For deprecations: add a clear note (e.g., :::caution or an admonition) and update any code examples.
 - For new features: add documentation in the appropriate section, matching the style of surrounding content.
 - For API changes: update signatures, parameters, return types, and examples as needed.
-- Keep the same tone and style as the existing document.
 
 Return ONLY the complete updated file content. No explanations, no markdown fencing around the whole file.
+
+## Sui Documentation Style Guide
+
+All edits MUST comply with the following style guide rules:
+
+### Voice and Tone
+- Use active voice, second person ("you"), and present tense.
+- Use simple words and concise sentences. Prefer plain language over complex phrasing.
+- Write for a global audience. Avoid jargon, slang, idioms, and cultural references.
+- Use "might" instead of "may". Use "through" instead of "via". Use "because" instead of "since".
+- Do not start sentences with "Please note" or "Note."
+- Do not use exclamation marks.
+
+### Spelling and Grammar
+- Use US English spelling.
+- Avoid Latin abbreviations (i.e., etc., et al.). Use "for example" or complete phrases.
+- Use the Oxford (serial) comma.
+- Do not write out numbers for quantities (use "24 files" not "twenty-four files").
+- Do not use quotation marks except for "Hello, World!".
+- Do not use ampersands (&) — write "and".
+- Do not use em dashes. Rewrite using commas, parentheses, or split into two sentences.
+
+### Capitalization
+- Title case for page titles: capitalize all words except short conjunctions/prepositions (a, an, and, but, for, in, or, so, to, with, yet), unless first or last word.
+- Sentence case for section headings, table cells, list items, captions.
+- Always capitalize: Sui, SUI, CLI, SDK, Devnet, Testnet, Mainnet, Localnet, GraphQL RPC, ID, and other proper nouns/product names listed in the style guide.
+- Always lowercase: gas, object, transaction, transfer, validator, wallet, smart contract, onchain, offchain, epoch, kiosk (instance).
+- Never hyphenate: key pair, layer 1, offchain, onchain, open source, use case.
+
+### Formatting
+- Use bold for UI elements (buttons, menus, field labels).
+- Use bold for term definitions in lists (term followed by colon).
+- Do not use italic text.
+- Use inline code (backticks) for: function names, object names, CLI commands, file names, file paths, variable names.
+- Console commands in codeblocks must start with `$`.
+- Use `:::caution` for deprecation warnings, `:::info` for neutral context, `:::tip` for best practices.
+
+### Structure
+- H1 (#) is reserved for page title only.
+- H2 (##) for top-level sections. H3 (###) for sub-topics. H4 (####) for short-form content.
+- Do not stack headings without body text between them.
+- Introduce lists with a short description ending in a colon.
+- Use numbered lists for sequences, bulleted lists for related items.
+
+### Links and References
+- Use full relative links when linking to topics on docs.sui.io.
+- Use descriptive text for links, never use a URL as link text.
+
+### Terminology
+- Use "app" rather than "dApp".
+- Use "recovery passphrase" not "mnemonic".
+- Spell out acronyms on first use, then use the acronym (except CLI and SDK, which are always acronyms).
 """
 
 
