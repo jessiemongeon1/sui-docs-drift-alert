@@ -15,7 +15,7 @@ on:
     - cron: '30 1,7,13,19 * * *'  # Every 6 hours
 
 permissions:
-  contents: read
+  contents: write
   issues: write
   actions: write
 
@@ -59,6 +59,20 @@ jobs:
           FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
         run: python scripts/monitor.py
 
+      - name: Persist state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          if git diff --cached --quiet; then
+            echo "No state changes to commit"
+          else
+            git pull --rebase origin main || true
+            git commit -m "chore: update processed PRs state (sui-docs)"
+            git push || echo "Push failed — state will be retried next run"
+          fi
+
   # -----------------------------------------------------------------------
   # Move book monitor (Sui PRs that affect Move language docs)
   # -----------------------------------------------------------------------
@@ -97,6 +111,20 @@ jobs:
           CREATE_PRS: ${{ inputs.create_prs || 'true' }}
           FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
         run: python scripts/monitor.py
+
+      - name: Persist state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          if git diff --cached --quiet; then
+            echo "No state changes to commit"
+          else
+            git pull --rebase origin main || true
+            git commit -m "chore: update processed PRs state (move-book)"
+            git push || echo "Push failed — state will be retried next run"
+          fi
 
   # -----------------------------------------------------------------------
   # Walrus docs monitor
@@ -137,6 +165,20 @@ jobs:
           FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
         run: python scripts/monitor.py
 
+      - name: Persist state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          if git diff --cached --quiet; then
+            echo "No state changes to commit"
+          else
+            git pull --rebase origin main || true
+            git commit -m "chore: update processed PRs state (walrus-docs)"
+            git push || echo "Push failed — state will be retried next run"
+          fi
+
   # -----------------------------------------------------------------------
   # Seal docs monitor
   # -----------------------------------------------------------------------
@@ -175,6 +217,20 @@ jobs:
           FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
         run: python scripts/monitor.py
 
+      - name: Persist state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          if git diff --cached --quiet; then
+            echo "No state changes to commit"
+          else
+            git pull --rebase origin main || true
+            git commit -m "chore: update processed PRs state (seal-docs)"
+            git push || echo "Push failed — state will be retried next run"
+          fi
+
   # -----------------------------------------------------------------------
   # SuiNS docs monitor
   # -----------------------------------------------------------------------
@@ -212,3 +268,17 @@ jobs:
           CREATE_PRS: ${{ inputs.create_prs || 'true' }}
           FORK_OWNER: ${{ vars.FORK_OWNER || secrets.FORK_OWNER }}
         run: python scripts/monitor.py
+
+      - name: Persist state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          if git diff --cached --quiet; then
+            echo "No state changes to commit"
+          else
+            git pull --rebase origin main || true
+            git commit -m "chore: update processed PRs state (suins-docs)"
+            git push || echo "Push failed — state will be retried next run"
+          fi

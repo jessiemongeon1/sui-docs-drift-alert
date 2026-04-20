@@ -13,9 +13,47 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import anthropic
 import requests
+
+# ---------------------------------------------------------------------------
+# State tracking — prevents reprocessing the same PR across runs
+# ---------------------------------------------------------------------------
+
+STATE_DIR = Path(__file__).parent.parent / "state"
+STATE_DIR.mkdir(exist_ok=True)
+
+
+def _state_file_for_job() -> Path:
+    """Return a per-job state file based on MONITORED_REPO."""
+    repo_slug = os.environ.get("MONITORED_REPO", "unknown").replace("/", "_").lower()
+    return STATE_DIR / f"processed_{repo_slug}.json"
+
+
+def load_processed_prs() -> set[int]:
+    """Load the set of PR numbers already processed by previous runs."""
+    path = _state_file_for_job()
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text())
+        return set(data.get("processed_prs", []))
+    except (json.JSONDecodeError, KeyError):
+        return set()
+
+
+def save_processed_prs(pr_numbers: set[int]):
+    """Persist the set of processed PR numbers."""
+    path = _state_file_for_job()
+    # Merge with existing state in case another job wrote concurrently
+    existing = load_processed_prs()
+    merged = existing | pr_numbers
+    # Keep only the most recent 500 PRs to prevent unbounded growth
+    trimmed = sorted(merged, reverse=True)[:500]
+    path.write_text(json.dumps({"processed_prs": trimmed}, indent=2) + "\n")
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -449,6 +487,7 @@ def triage_release_notes(prs_with_notes: list[dict]) -> list[dict]:
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
+        temperature=0,
         max_tokens=4096,
         system=TRIAGE_SYSTEM,
         messages=[{"role": "user", "content": content}],
@@ -470,6 +509,7 @@ def find_affected_docs(change: dict, docs_index: str) -> list[dict]:
     """Ask Claude which doc pages are affected by a specific change."""
     message = client.messages.create(
         model="claude-sonnet-4-6",
+        temperature=0,
         max_tokens=4096,
         system=DOCS_MATCH_SYSTEM,
         messages=[
@@ -502,6 +542,7 @@ def review_doc_page(change: dict, doc_url: str, doc_content: str) -> str:
     """Ask Claude to review a specific doc page against a change."""
     message = client.messages.create(
         model="claude-sonnet-4-6",
+        temperature=0,
         max_tokens=2048,
         system=DOC_REVIEW_SYSTEM,
         messages=[
@@ -524,6 +565,7 @@ def generate_doc_edit(change: dict, review: str, file_content: str) -> str:
     """Ask Claude to produce the updated file content."""
     message = client.messages.create(
         model="claude-sonnet-4-6",
+        temperature=0,
         max_tokens=16384,
         system=DOC_EDIT_SYSTEM,
         messages=[
@@ -813,6 +855,16 @@ def main():
         return
 
     print(f"Total unique PRs: {len(all_pr_numbers)}")
+
+    # Filter out PRs already processed in previous runs
+    already_processed = load_processed_prs()
+    new_pr_numbers = all_pr_numbers - already_processed
+    if not new_pr_numbers:
+        print(f"All {len(all_pr_numbers)} PR(s) already processed in previous runs. Nothing to do.")
+        return
+    if len(new_pr_numbers) < len(all_pr_numbers):
+        print(f"Skipping {len(all_pr_numbers) - len(new_pr_numbers)} already-processed PR(s), {len(new_pr_numbers)} new")
+    all_pr_numbers = new_pr_numbers
 
     # Step 3: Fetch PR details and release notes
     print("\nStep 3: Fetching PR details and release notes...")
@@ -1160,7 +1212,10 @@ def main():
         repo_url = f"https://github.com/{THIS_REPO}/issues" if THIS_REPO else ""
         send_slack_notification(repo_url, slack_summary)
 
-    print("\nDone!")
+    # Mark all PRs from this run as processed so they aren't picked up again
+    save_processed_prs(all_pr_numbers)
+    print(f"\nSaved {len(all_pr_numbers)} PR(s) to processed state.")
+    print("Done!")
 
 
 if __name__ == "__main__":
