@@ -363,13 +363,18 @@ Given release notes from merged PRs, determine which changes could affect existi
 
 Do NOT flag deprecations. Ignore any change that is purely a deprecation notice.
 
-For each impactful change, output a JSON array of objects with:
+IMPORTANT: Some PRs include an "AI Quality Review" of their release notes. Pay close attention to these reviews:
+- If the quality review says the release notes are MISSING information, have INACCURATE descriptions, or are INCOMPLETE, do NOT trust those release notes for documentation decisions. Exclude that PR from your results — unreliable release notes should not drive documentation changes.
+- If the quality review says the notes are accurate and complete, proceed normally.
+- If no quality review is provided, assess the release notes at face value.
+
+For each impactful change (from PRs with trustworthy release notes), output a JSON array of objects with:
 - "pr_number": the PR number
 - "change_summary": brief description of the doc-affecting change
 - "change_type": one of "api_change", "breaking_change", "new_feature", "config_change", "framework_change"
 - "search_terms": array of specific terms to search for in docs (function names, module names, API endpoints, etc.)
 
-If NO changes affect documentation, return an empty array: []
+If NO changes affect documentation (or all release notes are unreliable), return an empty array: []
 
 Return ONLY valid JSON, no markdown fencing."""
 
@@ -483,6 +488,40 @@ All edits MUST comply with the following style guide rules:
 """
 
 
+def fetch_release_notes_quality_review(pr_number: int) -> str | None:
+    """Fetch the AI quality review of a PR's release notes from the release notes Slack thread.
+
+    Looks for messages containing ':robot_face: AI Review' or similar bot review patterns
+    in the thread for the given PR. Returns the review text if found, None otherwise.
+    """
+    if not SLACK_BOT_TOKEN or not SLACK_RELEASE_NOTES_CHANNEL_ID:
+        return None
+
+    thread_ts = find_release_notes_message_for_pr(pr_number)
+    if not thread_ts:
+        return None
+
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    resp = requests.get(
+        "https://slack.com/api/conversations.replies",
+        headers=headers,
+        params={"channel": SLACK_RELEASE_NOTES_CHANNEL_ID, "ts": thread_ts, "limit": 50},
+        timeout=15,
+    )
+    if resp.status_code != 200 or not resp.json().get("ok"):
+        print(f"  [slack-rn] Failed to fetch thread replies for PR #{pr_number}")
+        return None
+
+    review_patterns = ["ai review", ":robot_face:", "🤖"]
+    for msg in resp.json().get("messages", [])[1:]:  # skip parent
+        text = msg.get("text", "")
+        if any(p in text.lower() for p in review_patterns):
+            print(f"  [slack-rn] Found AI quality review for PR #{pr_number}")
+            return text
+
+    return None
+
+
 NO_UPDATE_REASON_SYSTEM = """You are a documentation impact analyst for the Sui blockchain project.
 
 You have already determined that a PR's release notes do NOT require documentation updates. Now explain WHY in a concise Slack message (3-5 sentences max).
@@ -492,6 +531,7 @@ Your explanation must:
 2. Briefly describe what the PR changed.
 3. Explain why these changes do not affect any user-facing documentation (e.g., internal refactor, performance optimization with no API change, test-only change, backend plumbing with no developer-visible effect).
 4. If relevant, mention which docs pages you considered and why they don't need updates.
+5. If an AI Quality Review flagged the release notes as incomplete or inaccurate, mention that the release notes were not reliable enough to base documentation changes on.
 
 Keep it concise and factual. No filler. Write in plain text suitable for a Slack thread reply."""
 
@@ -505,6 +545,9 @@ def generate_no_update_reason(pr: dict) -> str:
             f"Author: {pr.get('author', 'unknown')}\n"
             f"Release Notes:\n{pr.get('release_notes', '(none)')}\n"
         )
+        quality_review = pr.get("quality_review")
+        if quality_review:
+            content += f"\nAI Quality Review of release notes:\n{quality_review}\n"
         message = client.messages.create(
             model="claude-sonnet-4-6",
             temperature=0,
@@ -519,14 +562,27 @@ def generate_no_update_reason(pr: dict) -> str:
 
 
 def triage_release_notes(prs_with_notes: list[dict]) -> list[dict]:
-    """Ask Claude which release notes affect documentation."""
+    """Ask Claude which release notes affect documentation.
+
+    Fetches AI quality reviews from the release notes Slack thread and includes
+    them so Claude can skip PRs with unreliable release notes.
+    """
     pr_summaries = []
     for pr in prs_with_notes:
-        pr_summaries.append(
+        summary = (
             f"PR #{pr['number']}: {pr['title']}\n"
             f"Author: {pr['author']}\n"
             f"Release Notes:\n{pr['release_notes']}\n"
         )
+        # Fetch quality review from the release notes Slack thread
+        quality_review = fetch_release_notes_quality_review(pr["number"])
+        if quality_review:
+            summary += f"\nAI Quality Review:\n{quality_review}\n"
+            pr["quality_review"] = quality_review
+        else:
+            summary += "\nAI Quality Review: (none available)\n"
+
+        pr_summaries.append(summary)
 
     content = "\n---\n".join(pr_summaries)
     if not content.strip():
