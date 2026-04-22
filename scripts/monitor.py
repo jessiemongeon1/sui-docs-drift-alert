@@ -820,12 +820,38 @@ def send_slack_notification(pr_url: str, summary: str):
         print(f"  [slack] Failed: {resp.status_code} {resp.text}")
 
 
+def ensure_bot_in_channel(channel_id: str, label: str = ""):
+    """Join a Slack channel if the bot is not already a member."""
+    if not SLACK_BOT_TOKEN or not channel_id:
+        return
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.post(
+        "https://slack.com/api/conversations.join",
+        headers=headers,
+        json={"channel": channel_id},
+        timeout=10,
+    )
+    data = resp.json()
+    if data.get("ok"):
+        print(f"  [slack{label}] Joined channel {channel_id}")
+    elif data.get("error") == "already_in_channel":
+        pass  # already joined, no action needed
+    else:
+        print(f"  [slack{label}] Failed to join channel {channel_id}: {data.get('error', resp.text)}")
+
+
 def find_slack_message_for_pr(pr_number: int) -> str | None:
     """Search the Slack channel for a message about a merged PR. Returns the message ts."""
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
         return None
 
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+
+    # Ensure bot is in the channel before reading history
+    ensure_bot_in_channel(SLACK_CHANNEL_ID)
 
     # Search recent history for a message mentioning this PR number
     resp = requests.get(
@@ -937,6 +963,10 @@ def find_release_notes_message_for_pr(pr_number: int) -> str | None:
         return None
 
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+
+    # Ensure bot is in the channel before reading history
+    ensure_bot_in_channel(SLACK_RELEASE_NOTES_CHANNEL_ID, label="-rn")
+
     resp = requests.get(
         "https://slack.com/api/conversations.history",
         headers=headers,
