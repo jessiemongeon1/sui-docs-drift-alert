@@ -1140,7 +1140,7 @@ def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None,
         print(f"  [slack-rn] No release notes message found for PR #{pr_number}")
         return
 
-    # Check if we already replied to this thread (another job may have posted first)
+    # Check existing thread replies to avoid duplicates
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
     replies_resp = requests.get(
         "https://slack.com/api/conversations.replies",
@@ -1151,11 +1151,27 @@ def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None,
     if replies_resp.status_code == 200 and replies_resp.json().get("ok"):
         for reply in replies_resp.json().get("messages", [])[1:]:  # skip the parent message
             reply_text = reply.get("text", "")
-            if f"PR #{pr_number}" in reply_text and DOCS_REPO in reply_text:
+            if f"PR #{pr_number}" not in reply_text:
+                continue
+            # If this exact DOCS_REPO already replied, always skip
+            if DOCS_REPO in reply_text:
                 print(f"  [slack-rn] Already replied for {DOCS_REPO} PR #{pr_number}, skipping")
+                return
+            # If another job already posted "no updates needed" and we also have
+            # "no updates needed", skip — no need for two identical verdicts
+            if not docs_pr_url and "No docs updates needed" in reply_text:
+                print(f"  [slack-rn] Another job already posted 'no updates needed' for PR #{pr_number}, skipping")
                 return
 
     react_to_slack_message(SLACK_RELEASE_NOTES_CHANNEL_ID, thread_ts, "white_check_mark", label="-rn")
+
+    # Drop the DOCS_REPO prefix when no updates are needed — the verdict is the same regardless of which docs repo
+    if not docs_pr_url:
+        if reason:
+            text = f"✅ No docs updates needed for PR #{pr_number}.\n\n{reason}"
+        else:
+            text = f"✅ No docs updates needed for PR #{pr_number}."
+
     post_to_slack_channel(SLACK_RELEASE_NOTES_CHANNEL_ID, text, thread_ts=thread_ts, label="-rn")
 
 
