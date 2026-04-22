@@ -918,32 +918,6 @@ def find_slack_message_for_pr(pr_number: int) -> str | None:
     return None
 
 
-def reply_to_slack_thread(thread_ts: str, text: str):
-    """Post a threaded reply to a Slack message."""
-    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
-        return
-
-    headers = {
-        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "channel": SLACK_CHANNEL_ID,
-        "thread_ts": thread_ts,
-        "text": text,
-    }
-    resp = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers=headers,
-        json=payload,
-        timeout=10,
-    )
-    data = resp.json()
-    if data.get("ok"):
-        print(f"  [slack] Thread reply sent")
-    else:
-        print(f"  [slack] Thread reply failed: {data.get('error', resp.text)}")
-
 
 def post_slack_webhook_message(text: str, channel_context: str = ""):
     """Post a standalone message via the Slack webhook as a fallback when bot token is unavailable."""
@@ -960,8 +934,34 @@ def post_slack_webhook_message(text: str, channel_context: str = ""):
         print(f"  [slack] Webhook fallback error: {e}")
 
 
+def post_to_slack_channel(channel_id: str, text: str, thread_ts: str | None = None, label: str = ""):
+    """Post a message to a Slack channel, optionally as a thread reply."""
+    if not SLACK_BOT_TOKEN or not channel_id:
+        return False
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload: dict = {"channel": channel_id, "text": text}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    resp = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers=headers,
+        json=payload,
+        timeout=10,
+    )
+    data = resp.json()
+    if data.get("ok"):
+        print(f"  [slack{label}] Message sent{'  (thread)' if thread_ts else ''}")
+        return True
+    else:
+        print(f"  [slack{label}] Message failed: {data.get('error', resp.text)}")
+        return False
+
+
 def notify_slack_for_pr(pr_number: int, docs_pr_url: str | None, reason: str = ""):
-    """Find the Slack message for a source PR and reply with the outcome in-thread."""
+    """Post the outcome to the tech-docs-checks channel. Replies in-thread if a matching message exists, otherwise posts standalone."""
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
         return
 
@@ -973,12 +973,12 @@ def notify_slack_for_pr(pr_number: int, docs_pr_url: str | None, reason: str = "
         text = f"✅ No docs updates needed for PR #{pr_number}."
 
     thread_ts = find_slack_message_for_pr(pr_number)
-    if not thread_ts:
-        print(f"  [slack] No message found for PR #{pr_number}, skipping thread reply")
-        return
-
-    react_to_slack_message(SLACK_CHANNEL_ID, thread_ts, "white_check_mark")
-    reply_to_slack_thread(thread_ts, text)
+    if thread_ts:
+        react_to_slack_message(SLACK_CHANNEL_ID, thread_ts, "white_check_mark")
+        post_to_slack_channel(SLACK_CHANNEL_ID, text, thread_ts=thread_ts)
+    else:
+        # No existing message to thread on — post standalone
+        post_to_slack_channel(SLACK_CHANNEL_ID, text)
 
 
 # ---------------------------------------------------------------------------
@@ -1037,32 +1037,6 @@ def find_release_notes_message_for_pr(pr_number: int) -> str | None:
 
     return None
 
-
-def reply_to_release_notes_thread(thread_ts: str, text: str):
-    """Post a threaded reply in the release notes Slack channel."""
-    if not SLACK_BOT_TOKEN or not SLACK_RELEASE_NOTES_CHANNEL_ID:
-        return
-
-    headers = {
-        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "channel": SLACK_RELEASE_NOTES_CHANNEL_ID,
-        "thread_ts": thread_ts,
-        "text": text,
-    }
-    resp = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers=headers,
-        json=payload,
-        timeout=10,
-    )
-    data = resp.json()
-    if data.get("ok"):
-        print(f"  [slack-rn] Release notes thread reply sent")
-    else:
-        print(f"  [slack-rn] Release notes thread reply failed: {data.get('error', resp.text)}")
 
 
 def react_to_slack_message(channel_id: str, timestamp: str, emoji: str, label: str = ""):
@@ -1126,7 +1100,7 @@ def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None,
                 return
 
     react_to_slack_message(SLACK_RELEASE_NOTES_CHANNEL_ID, thread_ts, "white_check_mark", label="-rn")
-    reply_to_release_notes_thread(thread_ts, text)
+    post_to_slack_channel(SLACK_RELEASE_NOTES_CHANNEL_ID, text, thread_ts=thread_ts, label="-rn")
 
 
 # ---------------------------------------------------------------------------
