@@ -11,6 +11,8 @@ on:
         description: 'Create PRs with doc fixes (true/false)'
         required: false
         default: 'true'
+  repository_dispatch:
+    types: [release-notes-published]
   schedule:
     - cron: '30 1,7,13,19 * * *'  # Every 6 hours
 
@@ -46,6 +48,9 @@ jobs:
           DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_RELEASE_NOTES_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_NOTES_CHANNEL_ID }}
           MONITORED_REPO: MystenLabs/sui
           MONITORED_WORKFLOW: release-notes-monitor.yml
           SCAN_MODE: workflow_runs
@@ -99,6 +104,9 @@ jobs:
           DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_RELEASE_NOTES_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_NOTES_CHANNEL_ID }}
           MONITORED_REPO: MystenLabs/sui
           MONITORED_WORKFLOW: release-notes-monitor.yml
           SCAN_MODE: workflow_runs
@@ -152,6 +160,9 @@ jobs:
           DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_RELEASE_NOTES_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_NOTES_CHANNEL_ID }}
           MONITORED_REPO: MystenLabs/walrus
           MONITORED_WORKFLOW: release-notes.yml
           SCAN_MODE: merged_prs
@@ -205,6 +216,9 @@ jobs:
           DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_RELEASE_NOTES_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_NOTES_CHANNEL_ID }}
           MONITORED_REPO: MystenLabs/seal
           SCAN_MODE: merged_prs
           DOCS_LLMS_URL: https://seal-docs.wal.app/llms.txt
@@ -257,6 +271,9 @@ jobs:
           DOCS_MONITOR_PAT: ${{ secrets.DOCS_MONITOR_PAT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_RELEASE_NOTES_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_NOTES_CHANNEL_ID }}
           MONITORED_REPO: MystenLabs/suins-contracts
           SCAN_MODE: merged_prs
           DOCS_LLMS_URL: https://docs.suins.io/llms.txt

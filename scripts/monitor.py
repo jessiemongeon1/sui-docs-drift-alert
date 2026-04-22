@@ -70,6 +70,12 @@ THIS_REPO = os.environ.get("THIS_REPO", "")
 
 # Slack notification
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
+
+# Second Slack channel where a bot posts release notes info.
+# This monitor replies to those posts with its outcome (PR link or "no update needed").
+SLACK_RELEASE_NOTES_CHANNEL_ID = os.environ.get("SLACK_RELEASE_NOTES_CHANNEL_ID", "")
 
 # When set to "merged_prs", skip workflow run scanning and directly scan
 # recently merged PRs. Useful for repos whose release-notes workflow runs
@@ -350,16 +356,17 @@ TRIAGE_SYSTEM = """You are a documentation impact analyst for the Sui blockchain
 Given release notes from merged PRs, determine which changes could affect existing documentation. Focus on:
 
 1. **API changes**: New, modified, or removed API methods/endpoints (JSON-RPC, GraphQL, SDK methods)
-2. **Deprecations**: Features, functions, or patterns marked as deprecated
-3. **Breaking changes**: Anything that changes existing behavior developers rely on
-4. **New features**: Significant new capabilities that should be documented
-5. **Configuration changes**: Changes to CLI flags, environment variables, config files
-6. **Move framework changes**: Changes to standard library modules, object model, transaction types
+2. **Breaking changes**: Anything that changes existing behavior developers rely on
+3. **New features**: Significant new capabilities that should be documented
+4. **Configuration changes**: Changes to CLI flags, environment variables, config files
+5. **Move framework changes**: Changes to standard library modules, object model, transaction types
+
+Do NOT flag deprecations. Ignore any change that is purely a deprecation notice.
 
 For each impactful change, output a JSON array of objects with:
 - "pr_number": the PR number
 - "change_summary": brief description of the doc-affecting change
-- "change_type": one of "api_change", "deprecation", "breaking_change", "new_feature", "config_change", "framework_change"
+- "change_type": one of "api_change", "breaking_change", "new_feature", "config_change", "framework_change"
 - "search_terms": array of specific terms to search for in docs (function names, module names, API endpoints, etc.)
 
 If NO changes affect documentation, return an empty array: []
@@ -390,13 +397,17 @@ You are given:
 1. A description of a code change from a PR
 2. The current content of a documentation page
 
-Determine if this documentation page needs to be updated because of the change. If so, explain:
+First, check whether the documentation page ALREADY covers the new feature, method, API, or behavior introduced by the change. If the page already documents it accurately, say "NO_UPDATE_NEEDED" and explain that it is already covered.
+
+If the page does need updating, explain:
 - What specific section(s) need updating
 - What is currently wrong or missing
 - What the update should say (brief suggestion)
 
 Be precise — reference specific headings, code examples, or paragraphs.
 If the page does NOT need updating for this change, say "NO_UPDATE_NEEDED" and briefly explain why.
+
+IMPORTANT: Never suggest adding deprecation warnings, deprecation notices, or any mention of deprecations. Do not flag deprecated features or suggest marking anything as deprecated.
 """
 
 DOC_EDIT_SYSTEM = """You are a technical writer for the Sui blockchain project.
@@ -411,9 +422,10 @@ Your job is to produce the COMPLETE updated file content with the necessary chan
 Rules:
 - Make ONLY the changes needed to address the code change. Do not rewrite or reorganize unrelated content.
 - Preserve all existing formatting, frontmatter, imports, and MDX components exactly.
-- For deprecations: add a clear note (e.g., :::caution or an admonition) and update any code examples.
 - For new features: add documentation in the appropriate section, matching the style of surrounding content.
 - For API changes: update signatures, parameters, return types, and examples as needed.
+- NEVER add deprecation warnings, deprecation notices, :::caution blocks about deprecations, or any mention of deprecations.
+- NEVER modify code blocks or code examples. Only update surrounding text, descriptions, and explanations.
 
 Return ONLY the complete updated file content. No explanations, no markdown fencing around the whole file.
 
@@ -451,7 +463,7 @@ All edits MUST comply with the following style guide rules:
 - Do not use italic text.
 - Use inline code (backticks) for: function names, object names, CLI commands, file names, file paths, variable names.
 - Console commands in codeblocks must start with `$`.
-- Use `:::caution` for deprecation warnings, `:::info` for neutral context, `:::tip` for best practices.
+- Use `:::info` for neutral context, `:::tip` for best practices. Do NOT add `:::caution` blocks for deprecation warnings.
 
 ### Structure
 - H1 (#) is reserved for page title only.
@@ -808,6 +820,186 @@ def send_slack_notification(pr_url: str, summary: str):
         print(f"  [slack] Failed: {resp.status_code} {resp.text}")
 
 
+def find_slack_message_for_pr(pr_number: int) -> str | None:
+    """Search the Slack channel for a message about a merged PR. Returns the message ts."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
+        return None
+
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+
+    # Search recent history for a message mentioning this PR number
+    resp = requests.get(
+        "https://slack.com/api/conversations.history",
+        headers=headers,
+        params={"channel": SLACK_CHANNEL_ID, "limit": 200},
+        timeout=15,
+    )
+    if resp.status_code != 200 or not resp.json().get("ok"):
+        print(f"  [slack] Failed to fetch channel history: {resp.text}")
+        return None
+
+    pr_patterns = [f"#{pr_number}", f"/{pr_number}", f"({pr_number})"]
+    for msg in resp.json().get("messages", []):
+        text = msg.get("text", "")
+        for block in msg.get("blocks", []):
+            if block.get("type") == "section":
+                txt = block.get("text", {})
+                if isinstance(txt, dict):
+                    text += " " + txt.get("text", "")
+        # Also check attachments
+        for att in msg.get("attachments", []):
+            text += " " + att.get("text", "") + " " + att.get("pretext", "")
+            text += " " + att.get("title", "")
+
+        if any(p in text for p in pr_patterns):
+            return msg["ts"]
+
+    return None
+
+
+def reply_to_slack_thread(thread_ts: str, text: str):
+    """Post a threaded reply to a Slack message."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
+        return
+
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "channel": SLACK_CHANNEL_ID,
+        "thread_ts": thread_ts,
+        "text": text,
+    }
+    resp = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers=headers,
+        json=payload,
+        timeout=10,
+    )
+    data = resp.json()
+    if data.get("ok"):
+        print(f"  [slack] Thread reply sent")
+    else:
+        print(f"  [slack] Thread reply failed: {data.get('error', resp.text)}")
+
+
+def notify_slack_for_pr(pr_number: int, docs_pr_url: str | None):
+    """Find the Slack message for a source PR and reply with the outcome."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
+        return
+
+    thread_ts = find_slack_message_for_pr(pr_number)
+    if not thread_ts:
+        print(f"  [slack] No message found for PR #{pr_number}, skipping thread reply")
+        return
+
+    if docs_pr_url:
+        text = f"Docs update PR opened: {docs_pr_url}"
+    else:
+        text = "No docs edit necessary."
+
+    reply_to_slack_thread(thread_ts, text)
+
+
+# ---------------------------------------------------------------------------
+# Release notes channel — reply to bot posts in a second Slack channel
+# ---------------------------------------------------------------------------
+
+
+def find_release_notes_message_for_pr(pr_number: int) -> str | None:
+    """Search the release notes Slack channel for a bot post about a PR.
+
+    Returns the message ts for threading, or None if not found.
+    """
+    if not SLACK_BOT_TOKEN or not SLACK_RELEASE_NOTES_CHANNEL_ID:
+        return None
+
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    resp = requests.get(
+        "https://slack.com/api/conversations.history",
+        headers=headers,
+        params={"channel": SLACK_RELEASE_NOTES_CHANNEL_ID, "limit": 200},
+        timeout=15,
+    )
+    if resp.status_code != 200 or not resp.json().get("ok"):
+        print(f"  [slack-rn] Failed to fetch release notes channel history: {resp.text}")
+        return None
+
+    pr_patterns = [f"#{pr_number}", f"/{pr_number}", f"({pr_number})", f"PR {pr_number}"]
+    for msg in resp.json().get("messages", []):
+        text = msg.get("text", "")
+        # Check blocks
+        for block in msg.get("blocks", []):
+            if block.get("type") == "section":
+                txt = block.get("text", {})
+                if isinstance(txt, dict):
+                    text += " " + txt.get("text", "")
+            elif block.get("type") == "rich_text":
+                for element in block.get("elements", []):
+                    for sub in element.get("elements", []):
+                        if sub.get("type") == "text":
+                            text += " " + sub.get("text", "")
+                        elif sub.get("type") == "link":
+                            text += " " + sub.get("url", "")
+        # Check attachments
+        for att in msg.get("attachments", []):
+            text += " " + att.get("text", "")
+            text += " " + att.get("pretext", "")
+            text += " " + att.get("title", "")
+            text += " " + att.get("fallback", "")
+
+        if any(p in text for p in pr_patterns):
+            return msg["ts"]
+
+    return None
+
+
+def reply_to_release_notes_thread(thread_ts: str, text: str):
+    """Post a threaded reply in the release notes Slack channel."""
+    if not SLACK_BOT_TOKEN or not SLACK_RELEASE_NOTES_CHANNEL_ID:
+        return
+
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "channel": SLACK_RELEASE_NOTES_CHANNEL_ID,
+        "thread_ts": thread_ts,
+        "text": text,
+    }
+    resp = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers=headers,
+        json=payload,
+        timeout=10,
+    )
+    data = resp.json()
+    if data.get("ok"):
+        print(f"  [slack-rn] Release notes thread reply sent")
+    else:
+        print(f"  [slack-rn] Release notes thread reply failed: {data.get('error', resp.text)}")
+
+
+def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None):
+    """Find the release notes bot post for a PR and reply with the docs monitor outcome."""
+    if not SLACK_BOT_TOKEN or not SLACK_RELEASE_NOTES_CHANNEL_ID:
+        return
+
+    thread_ts = find_release_notes_message_for_pr(pr_number)
+    if not thread_ts:
+        print(f"  [slack-rn] No release notes message found for PR #{pr_number}")
+        return
+
+    if docs_pr_url:
+        text = f"📝 Docs update PR opened: {docs_pr_url}"
+    else:
+        text = "✅ No docs updates needed for this change."
+
+    reply_to_release_notes_thread(thread_ts, text)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -889,6 +1081,12 @@ def main():
 
     if not prs_with_notes:
         print("No PRs with release notes found. Nothing to do.")
+        if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+            for pr_num in sorted(all_pr_numbers):
+                notify_slack_for_pr(pr_num, None)
+        for pr_num in sorted(all_pr_numbers):
+            notify_release_notes_channel_for_pr(pr_num, None)
+        save_processed_prs(all_pr_numbers)
         return
 
     print(f"\nFound {len(prs_with_notes)} PR(s) with release notes")
@@ -899,6 +1097,12 @@ def main():
 
     if not impactful_changes:
         print("No doc-affecting changes found. All clear!")
+        if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+            for pr_num in sorted(all_pr_numbers):
+                notify_slack_for_pr(pr_num, None)
+        for pr_num in sorted(all_pr_numbers):
+            notify_release_notes_channel_for_pr(pr_num, None)
+        save_processed_prs(all_pr_numbers)
         return
 
     print(f"Found {len(impactful_changes)} potentially doc-affecting change(s)")
@@ -1012,6 +1216,8 @@ def main():
 
     # Step 8: Create PR or fall back to issues
     pr_created = False
+    pr_url = None
+    committed_files = []
 
     if CREATE_PRS and FORK_OWNER:
         # Deduplicate: if multiple changes affect the same file, keep only the last
@@ -1211,6 +1417,29 @@ def main():
         )
         repo_url = f"https://github.com/{THIS_REPO}/issues" if THIS_REPO else ""
         send_slack_notification(repo_url, slack_summary)
+
+    # Step 9: Reply to Slack threads for each source PR
+    # Determine which source PRs got docs edits in the created PR
+    pr_numbers_with_edits: set[int] = set()
+    if pr_created:
+        for edit in committed_files:
+            pr_numbers_with_edits.add(edit["change"]["pr_number"])
+
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+        print("\nStep 9a: Replying to Slack threads for source PRs...")
+        for pr_num in sorted(all_pr_numbers):
+            if pr_num in pr_numbers_with_edits and pr_url:
+                notify_slack_for_pr(pr_num, pr_url)
+            else:
+                notify_slack_for_pr(pr_num, None)
+
+    # Step 9b: Reply to release notes bot posts in the second channel
+    print("\nStep 9b: Replying to release notes channel...")
+    for pr_num in sorted(all_pr_numbers):
+        if pr_num in pr_numbers_with_edits and pr_url:
+            notify_release_notes_channel_for_pr(pr_num, pr_url)
+        else:
+            notify_release_notes_channel_for_pr(pr_num, None)
 
     # Mark all PRs from this run as processed so they aren't picked up again
     save_processed_prs(all_pr_numbers)
