@@ -483,6 +483,41 @@ All edits MUST comply with the following style guide rules:
 """
 
 
+NO_UPDATE_REASON_SYSTEM = """You are a documentation impact analyst for the Sui blockchain project.
+
+You have already determined that a PR's release notes do NOT require documentation updates. Now explain WHY in a concise Slack message (3-5 sentences max).
+
+Your explanation must:
+1. Reference the specific PR by number and title.
+2. Briefly describe what the PR changed.
+3. Explain why these changes do not affect any user-facing documentation (e.g., internal refactor, performance optimization with no API change, test-only change, backend plumbing with no developer-visible effect).
+4. If relevant, mention which docs pages you considered and why they don't need updates.
+
+Keep it concise and factual. No filler. Write in plain text suitable for a Slack thread reply."""
+
+
+def generate_no_update_reason(pr: dict) -> str:
+    """Ask Claude to explain why a PR does not require documentation updates."""
+    try:
+        content = (
+            f"PR #{pr['number']}: {pr['title']}\n"
+            f"URL: {pr.get('html_url', f'https://github.com/{MONITORED_REPO}/pull/{pr[\"number\"]}')}\n"
+            f"Author: {pr.get('author', 'unknown')}\n"
+            f"Release Notes:\n{pr.get('release_notes', '(none)')}\n"
+        )
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            temperature=0,
+            max_tokens=512,
+            system=NO_UPDATE_REASON_SYSTEM,
+            messages=[{"role": "user", "content": content}],
+        )
+        return message.content[0].text.strip()
+    except Exception as e:
+        print(f"  [reason] Failed to generate reason for PR #{pr['number']}: {e}")
+        return f"No documentation updates needed for PR #{pr['number']}."
+
+
 def triage_release_notes(prs_with_notes: list[dict]) -> list[dict]:
     """Ask Claude which release notes affect documentation."""
     pr_summaries = []
@@ -925,27 +960,24 @@ def post_slack_webhook_message(text: str, channel_context: str = ""):
         print(f"  [slack] Webhook fallback error: {e}")
 
 
-def notify_slack_for_pr(pr_number: int, docs_pr_url: str | None):
-    """Find the Slack message for a source PR and reply with the outcome.
-
-    If a bot token with proper scopes is available, replies in-thread.
-    Otherwise falls back to posting via the webhook.
-    """
-    if docs_pr_url:
-        text = f"Docs update PR opened for PR #{pr_number}: {docs_pr_url}"
-    else:
-        text = f"No docs updates needed for PR #{pr_number}."
-
+def notify_slack_for_pr(pr_number: int, docs_pr_url: str | None, reason: str = ""):
+    """Find the Slack message for a source PR and reply with the outcome in-thread."""
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
-        post_slack_webhook_message(text)
         return
+
+    if docs_pr_url:
+        text = f"📝 Docs update PR opened for PR #{pr_number}: {docs_pr_url}"
+    elif reason:
+        text = f"✅ No docs updates needed for PR #{pr_number}.\n\n{reason}"
+    else:
+        text = f"✅ No docs updates needed for PR #{pr_number}."
 
     thread_ts = find_slack_message_for_pr(pr_number)
     if not thread_ts:
-        print(f"  [slack] No message found for PR #{pr_number}, posting via webhook fallback")
-        post_slack_webhook_message(text)
+        print(f"  [slack] No message found for PR #{pr_number}, skipping thread reply")
         return
 
+    react_to_slack_message(SLACK_CHANNEL_ID, thread_ts, "white_check_mark")
     reply_to_slack_thread(thread_ts, text)
 
 
@@ -1033,27 +1065,47 @@ def reply_to_release_notes_thread(thread_ts: str, text: str):
         print(f"  [slack-rn] Release notes thread reply failed: {data.get('error', resp.text)}")
 
 
-def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None):
-    """Find the release notes bot post for a PR and reply with the docs monitor outcome.
+def react_to_slack_message(channel_id: str, timestamp: str, emoji: str, label: str = ""):
+    """Add an emoji reaction to a Slack message."""
+    if not SLACK_BOT_TOKEN:
+        return
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.post(
+        "https://slack.com/api/reactions.add",
+        headers=headers,
+        json={"channel": channel_id, "timestamp": timestamp, "name": emoji},
+        timeout=10,
+    )
+    data = resp.json()
+    if data.get("ok"):
+        print(f"  [slack{label}] Reacted with :{emoji}:")
+    elif data.get("error") == "already_reacted":
+        pass  # already reacted, no action needed
+    else:
+        print(f"  [slack{label}] Reaction failed: {data.get('error', resp.text)}")
 
-    If a bot token with proper scopes is available, replies in-thread.
-    Otherwise falls back to posting via the webhook.
-    """
+
+def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None, reason: str = ""):
+    """Find the release notes bot post for a PR and reply with the docs monitor outcome in-thread."""
+    if not SLACK_BOT_TOKEN or not SLACK_RELEASE_NOTES_CHANNEL_ID:
+        return
+
     if docs_pr_url:
         text = f"📝 Docs update PR opened for PR #{pr_number}: {docs_pr_url}"
+    elif reason:
+        text = f"✅ No docs updates needed for PR #{pr_number}.\n\n{reason}"
     else:
         text = f"✅ No docs updates needed for PR #{pr_number}."
 
-    if not SLACK_BOT_TOKEN or not SLACK_RELEASE_NOTES_CHANNEL_ID:
-        post_slack_webhook_message(text, channel_context="release-notes")
-        return
-
     thread_ts = find_release_notes_message_for_pr(pr_number)
     if not thread_ts:
-        print(f"  [slack-rn] No release notes message found for PR #{pr_number}, posting via webhook fallback")
-        post_slack_webhook_message(text, channel_context="release-notes")
+        print(f"  [slack-rn] No release notes message found for PR #{pr_number}")
         return
 
+    react_to_slack_message(SLACK_RELEASE_NOTES_CHANNEL_ID, thread_ts, "white_check_mark", label="-rn")
     reply_to_release_notes_thread(thread_ts, text)
 
 
@@ -1138,11 +1190,12 @@ def main():
 
     if not prs_with_notes:
         print("No PRs with release notes found. Nothing to do.")
+        no_notes_reason = "This PR does not contain a release notes section, so no documentation impact assessment is needed."
         if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
             for pr_num in sorted(all_pr_numbers):
-                notify_slack_for_pr(pr_num, None)
+                notify_slack_for_pr(pr_num, None, reason=no_notes_reason)
         for pr_num in sorted(all_pr_numbers):
-            notify_release_notes_channel_for_pr(pr_num, None)
+            notify_release_notes_channel_for_pr(pr_num, None, reason=no_notes_reason)
         save_processed_prs(all_pr_numbers)
         return
 
@@ -1154,11 +1207,18 @@ def main():
 
     if not impactful_changes:
         print("No doc-affecting changes found. All clear!")
+        # Generate a detailed reason for each PR explaining why no docs update is needed
+        pr_reasons: dict[int, str] = {}
+        for pr in prs_with_notes:
+            print(f"  Generating reason for PR #{pr['number']}...")
+            pr_reasons[pr["number"]] = generate_no_update_reason(pr)
         if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
             for pr_num in sorted(all_pr_numbers):
-                notify_slack_for_pr(pr_num, None)
+                reason = pr_reasons.get(pr_num, "No release notes with documentation impact found.")
+                notify_slack_for_pr(pr_num, None, reason=reason)
         for pr_num in sorted(all_pr_numbers):
-            notify_release_notes_channel_for_pr(pr_num, None)
+            reason = pr_reasons.get(pr_num, "No release notes with documentation impact found.")
+            notify_release_notes_channel_for_pr(pr_num, None, reason=reason)
         save_processed_prs(all_pr_numbers)
         return
 
@@ -1482,13 +1542,25 @@ def main():
         for edit in committed_files:
             pr_numbers_with_edits.add(edit["change"]["pr_number"])
 
+    # Generate reasons for PRs that did NOT get edits
+    pr_no_edit_reasons: dict[int, str] = {}
+    prs_without_edits = sorted(all_pr_numbers - pr_numbers_with_edits)
+    if prs_without_edits:
+        print("\nGenerating reasons for PRs without docs edits...")
+        for pr_num in prs_without_edits:
+            pr_data = next((p for p in prs_with_notes if p["number"] == pr_num), None)
+            if pr_data:
+                pr_no_edit_reasons[pr_num] = generate_no_update_reason(pr_data)
+            else:
+                pr_no_edit_reasons[pr_num] = "No release notes with documentation impact found."
+
     if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
         print("\nStep 9a: Replying to Slack threads for source PRs...")
         for pr_num in sorted(all_pr_numbers):
             if pr_num in pr_numbers_with_edits and pr_url:
                 notify_slack_for_pr(pr_num, pr_url)
             else:
-                notify_slack_for_pr(pr_num, None)
+                notify_slack_for_pr(pr_num, None, reason=pr_no_edit_reasons.get(pr_num, ""))
 
     # Step 9b: Reply to release notes bot posts in the second channel
     print("\nStep 9b: Replying to release notes channel...")
@@ -1496,7 +1568,7 @@ def main():
         if pr_num in pr_numbers_with_edits and pr_url:
             notify_release_notes_channel_for_pr(pr_num, pr_url)
         else:
-            notify_release_notes_channel_for_pr(pr_num, None)
+            notify_release_notes_channel_for_pr(pr_num, None, reason=pr_no_edit_reasons.get(pr_num, ""))
 
     # Mark all PRs from this run as processed so they aren't picked up again
     save_processed_prs(all_pr_numbers)
