@@ -884,20 +884,41 @@ def reply_to_slack_thread(thread_ts: str, text: str):
         print(f"  [slack] Thread reply failed: {data.get('error', resp.text)}")
 
 
+def post_slack_webhook_message(text: str, channel_context: str = ""):
+    """Post a standalone message via the Slack webhook as a fallback when bot token is unavailable."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    payload = {"text": text}
+    try:
+        resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        if resp.status_code == 200:
+            print(f"  [slack] Webhook fallback message sent{f' ({channel_context})' if channel_context else ''}")
+        else:
+            print(f"  [slack] Webhook fallback failed: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"  [slack] Webhook fallback error: {e}")
+
+
 def notify_slack_for_pr(pr_number: int, docs_pr_url: str | None):
-    """Find the Slack message for a source PR and reply with the outcome."""
+    """Find the Slack message for a source PR and reply with the outcome.
+
+    If a bot token with proper scopes is available, replies in-thread.
+    Otherwise falls back to posting via the webhook.
+    """
+    if docs_pr_url:
+        text = f"Docs update PR opened for PR #{pr_number}: {docs_pr_url}"
+    else:
+        text = f"No docs updates needed for PR #{pr_number}."
+
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
+        post_slack_webhook_message(text)
         return
 
     thread_ts = find_slack_message_for_pr(pr_number)
     if not thread_ts:
-        print(f"  [slack] No message found for PR #{pr_number}, skipping thread reply")
+        print(f"  [slack] No message found for PR #{pr_number}, posting via webhook fallback")
+        post_slack_webhook_message(text)
         return
-
-    if docs_pr_url:
-        text = f"Docs update PR opened: {docs_pr_url}"
-    else:
-        text = "No docs edit necessary."
 
     reply_to_slack_thread(thread_ts, text)
 
@@ -983,19 +1004,25 @@ def reply_to_release_notes_thread(thread_ts: str, text: str):
 
 
 def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None):
-    """Find the release notes bot post for a PR and reply with the docs monitor outcome."""
+    """Find the release notes bot post for a PR and reply with the docs monitor outcome.
+
+    If a bot token with proper scopes is available, replies in-thread.
+    Otherwise falls back to posting via the webhook.
+    """
+    if docs_pr_url:
+        text = f"📝 Docs update PR opened for PR #{pr_number}: {docs_pr_url}"
+    else:
+        text = f"✅ No docs updates needed for PR #{pr_number}."
+
     if not SLACK_BOT_TOKEN or not SLACK_RELEASE_NOTES_CHANNEL_ID:
+        post_slack_webhook_message(text, channel_context="release-notes")
         return
 
     thread_ts = find_release_notes_message_for_pr(pr_number)
     if not thread_ts:
-        print(f"  [slack-rn] No release notes message found for PR #{pr_number}")
+        print(f"  [slack-rn] No release notes message found for PR #{pr_number}, posting via webhook fallback")
+        post_slack_webhook_message(text, channel_context="release-notes")
         return
-
-    if docs_pr_url:
-        text = f"📝 Docs update PR opened: {docs_pr_url}"
-    else:
-        text = "✅ No docs updates needed for this change."
 
     reply_to_release_notes_thread(thread_ts, text)
 
