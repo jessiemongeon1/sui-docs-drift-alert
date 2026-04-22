@@ -501,7 +501,7 @@ def generate_no_update_reason(pr: dict) -> str:
     try:
         content = (
             f"PR #{pr['number']}: {pr['title']}\n"
-            f"URL: {pr.get('html_url', f'https://github.com/{MONITORED_REPO}/pull/{pr[\"number\"]}')}\n"
+            f"URL: {pr.get('html_url', 'https://github.com/' + MONITORED_REPO + '/pull/' + str(pr['number']))}\n"
             f"Author: {pr.get('author', 'unknown')}\n"
             f"Release Notes:\n{pr.get('release_notes', '(none)')}\n"
         )
