@@ -1093,17 +1093,37 @@ def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None,
     if not SLACK_BOT_TOKEN or not SLACK_RELEASE_NOTES_CHANNEL_ID:
         return
 
+    # Skip if this is the same channel as SLACK_CHANNEL_ID to avoid double-posting
+    if SLACK_RELEASE_NOTES_CHANNEL_ID == SLACK_CHANNEL_ID:
+        print(f"  [slack-rn] Same channel as SLACK_CHANNEL_ID, skipping duplicate reply for PR #{pr_number}")
+        return
+
     if docs_pr_url:
-        text = f"📝 Docs update PR opened for PR #{pr_number}: {docs_pr_url}"
+        text = f"📝 *{DOCS_REPO}* docs update PR opened for PR #{pr_number}: {docs_pr_url}"
     elif reason:
-        text = f"✅ No docs updates needed for PR #{pr_number}.\n\n{reason}"
+        text = f"✅ *{DOCS_REPO}*: No docs updates needed for PR #{pr_number}.\n\n{reason}"
     else:
-        text = f"✅ No docs updates needed for PR #{pr_number}."
+        text = f"✅ *{DOCS_REPO}*: No docs updates needed for PR #{pr_number}."
 
     thread_ts = find_release_notes_message_for_pr(pr_number)
     if not thread_ts:
         print(f"  [slack-rn] No release notes message found for PR #{pr_number}")
         return
+
+    # Check if we already replied to this thread (another job may have posted first)
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    replies_resp = requests.get(
+        "https://slack.com/api/conversations.replies",
+        headers=headers,
+        params={"channel": SLACK_RELEASE_NOTES_CHANNEL_ID, "ts": thread_ts, "limit": 50},
+        timeout=15,
+    )
+    if replies_resp.status_code == 200 and replies_resp.json().get("ok"):
+        for reply in replies_resp.json().get("messages", [])[1:]:  # skip the parent message
+            reply_text = reply.get("text", "")
+            if f"PR #{pr_number}" in reply_text and DOCS_REPO in reply_text:
+                print(f"  [slack-rn] Already replied for {DOCS_REPO} PR #{pr_number}, skipping")
+                return
 
     react_to_slack_message(SLACK_RELEASE_NOTES_CHANNEL_ID, thread_ts, "white_check_mark", label="-rn")
     reply_to_release_notes_thread(thread_ts, text)
