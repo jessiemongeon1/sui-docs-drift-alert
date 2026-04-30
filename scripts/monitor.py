@@ -1017,24 +1017,66 @@ def post_to_slack_channel(channel_id: str, text: str, thread_ts: str | None = No
 
 
 def notify_slack_for_pr(pr_number: int, docs_pr_url: str | None, reason: str = ""):
-    """Post the outcome to the tech-docs-checks channel. Replies in-thread if a matching message exists, otherwise posts standalone."""
+    """Post the outcome to the primary Slack channel. Replies in-thread if a matching message exists, otherwise posts standalone. Deduplicates across parallel jobs."""
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
         return
 
+    pr_link = f"<https://github.com/{MONITORED_REPO}/pull/{pr_number}|{MONITORED_REPO}#{pr_number}>"
     if docs_pr_url:
-        text = f"📝 Docs update PR opened for PR #{pr_number}: {docs_pr_url}"
+        text = f"📝 Docs update PR opened for {pr_link}: {docs_pr_url}"
     elif reason:
-        text = f"✅ No docs updates needed for PR #{pr_number}.\n\n{reason}"
+        text = f"✅ No docs updates needed for {pr_link}.\n\n{reason}"
     else:
-        text = f"✅ No docs updates needed for PR #{pr_number}."
+        text = f"✅ No docs updates needed for {pr_link}."
 
     thread_ts = find_slack_message_for_pr(pr_number)
     if thread_ts:
+        # Check existing thread replies to avoid duplicates across parallel jobs
+        headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+        replies_resp = requests.get(
+            "https://slack.com/api/conversations.replies",
+            headers=headers,
+            params={"channel": SLACK_CHANNEL_ID, "ts": thread_ts, "limit": 50},
+            timeout=15,
+        )
+        if replies_resp.status_code == 200 and replies_resp.json().get("ok"):
+            for reply in replies_resp.json().get("messages", [])[1:]:  # skip parent
+                reply_text = reply.get("text", "")
+                if f"#{pr_number}" not in reply_text and f"{MONITORED_REPO}#{pr_number}" not in reply_text:
+                    continue
+                if DOCS_REPO in reply_text:
+                    print(f"  [slack] Already replied for {DOCS_REPO} PR #{pr_number}, skipping")
+                    return
+                if not docs_pr_url and "No docs updates needed" in reply_text:
+                    print(f"  [slack] Another job already posted 'no updates needed' for PR #{pr_number}, skipping")
+                    return
+
         react_to_slack_message(SLACK_CHANNEL_ID, thread_ts, "white_check_mark")
-        post_to_slack_channel(SLACK_CHANNEL_ID, text, thread_ts=thread_ts)
+        if not post_to_slack_channel(SLACK_CHANNEL_ID, text, thread_ts=thread_ts):
+            post_slack_webhook_message(text)
     else:
-        # No existing message to thread on — post standalone
-        post_to_slack_channel(SLACK_CHANNEL_ID, text)
+        # No existing message to thread on — check recent standalone messages for duplicates
+        ensure_bot_in_channel(SLACK_CHANNEL_ID)
+        headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+        resp = requests.get(
+            "https://slack.com/api/conversations.history",
+            headers=headers,
+            params={"channel": SLACK_CHANNEL_ID, "limit": 50},
+            timeout=15,
+        )
+        if resp.status_code == 200 and resp.json().get("ok"):
+            for msg in resp.json().get("messages", []):
+                msg_text = msg.get("text", "")
+                if (f"#{pr_number}" in msg_text or f"{MONITORED_REPO}#{pr_number}" in msg_text):
+                    if DOCS_REPO in msg_text:
+                        print(f"  [slack] Already posted for {DOCS_REPO} PR #{pr_number}, skipping")
+                        return
+                    if not docs_pr_url and "No docs updates needed" in msg_text:
+                        print(f"  [slack] Another job already posted 'no updates needed' for PR #{pr_number}, skipping")
+                        return
+
+        if not post_to_slack_channel(SLACK_CHANNEL_ID, text):
+            post_slack_webhook_message(text)
 
 
 # ---------------------------------------------------------------------------
@@ -1128,12 +1170,13 @@ def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None,
         print(f"  [slack-rn] Same channel as SLACK_CHANNEL_ID, skipping duplicate reply for PR #{pr_number}")
         return
 
+    pr_link = f"<https://github.com/{MONITORED_REPO}/pull/{pr_number}|{MONITORED_REPO}#{pr_number}>"
     if docs_pr_url:
-        text = f"📝 *{DOCS_REPO}* docs update PR opened for PR #{pr_number}: {docs_pr_url}"
+        text = f"📝 *{DOCS_REPO}* docs update PR opened for {pr_link}: {docs_pr_url}"
     elif reason:
-        text = f"✅ *{DOCS_REPO}*: No docs updates needed for PR #{pr_number}.\n\n{reason}"
+        text = f"✅ *{DOCS_REPO}*: No docs updates needed for {pr_link}.\n\n{reason}"
     else:
-        text = f"✅ *{DOCS_REPO}*: No docs updates needed for PR #{pr_number}."
+        text = f"✅ *{DOCS_REPO}*: No docs updates needed for {pr_link}."
 
     thread_ts = find_release_notes_message_for_pr(pr_number)
     if not thread_ts:
@@ -1168,9 +1211,9 @@ def notify_release_notes_channel_for_pr(pr_number: int, docs_pr_url: str | None,
     # Drop the DOCS_REPO prefix when no updates are needed — the verdict is the same regardless of which docs repo
     if not docs_pr_url:
         if reason:
-            text = f"✅ No docs updates needed for PR #{pr_number}.\n\n{reason}"
+            text = f"✅ No docs updates needed for {pr_link}.\n\n{reason}"
         else:
-            text = f"✅ No docs updates needed for PR #{pr_number}."
+            text = f"✅ No docs updates needed for {pr_link}."
 
     post_to_slack_channel(SLACK_RELEASE_NOTES_CHANNEL_ID, text, thread_ts=thread_ts, label="-rn")
 
